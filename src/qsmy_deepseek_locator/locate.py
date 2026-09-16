@@ -425,6 +425,10 @@ class Locator:
             use_tools: 是否开启工具（Agent）调用。v0.1 **没有实现工具循环**，只能保持 False；
                 传 True 会当场抛 NotImplementedError。这是预留参数：宁可报错，
                 也不静默忽略 —— 静默忽略会让你以为工具已经开了。
+                想自己接工具请走底层：DeepSeekVisionClient.complete(messages, tools=[...])，
+                调用结果落在 ChatReply.tool_calls。本库负责透传报文与拼回分片，**不执行工具**。
+                @doc docs/API-NOTES.md#61-工具调用也是流式的而且一个字符一个-chunk
+                （该文档解决"工具调用的参数为什么要按 index 自己拼、on_event 能拿到什么"的问题。）
             max_tokens: 输出上限（含思考 token）。正文为空时优先调大它。
             timeout: 单次请求超时（秒）。
             max_side: 发送前把图缩到最长边不超过它（归一化坐标不受影响，只省上行流量）。
@@ -445,7 +449,12 @@ class Locator:
                 "use_tools=True 目前不可用：v0.1 没有实现工具（Agent）调用循环。\n"
                 "这个参数是预留给调用点的，传 True 会当场报错而不是被静默忽略 —— "
                 "静默忽略会让你以为工具已经开了，那比报错危险得多。\n"
-                "需要多轮工具调用请参考 deepseek-vision-annotation 里的 Agent 实现，或等本库后续版本。"
+                "需要多轮工具调用请参考 deepseek-vision-annotation 里的 Agent 实现，或等本库后续版本。\n"
+                "只想拿到模型的工具调用请求（不执行）可以用底层：\n"
+                "    client = DeepSeekVisionClient()\n"
+                "    reply = client.complete(messages, tools=[...])\n"
+                "    reply.tool_calls  # 已按 index 拼好，arguments 是完整 JSON 串\n"
+                "事件流示例见 examples/stream_events.py --tools。"
             )
 
         # 先校验输出路径再调模型：这是**故意**的顺序，一次 API 调用不该因为路径拼错而白花。

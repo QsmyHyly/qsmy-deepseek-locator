@@ -101,12 +101,46 @@
 直接取 `chunk.choices[0]` 会 IndexError。
 
 本库的处理：`client.stream()` 把每个 chunk 拆成
-`{"type": "reasoning"|"content"|"finish"|"usage"|"model"}` 事件，
+`{"type": "reasoning"|"content"|"tool_call"|"finish"|"usage"|"model"}` 事件，
 既吞掉了空 choices 的坑，也让 CLI 能实时显示进度。
 `stream_options={"include_usage": True}` 用来顺带拿 usage；遇到不认这个字段的兼容服务会自动去掉重试一次
 （那只影响「能不能顺手拿到 usage」，不该让整轮识别失败）。
 
-@doc 对应实现：`client.py`（_events_from_chunk / _create）
+还有一个反直觉的地方：**服务端在每个 chunk 上都带 `model` 字段**。
+照单全收的话一次调用会甩出上百条一模一样的 model 事件（实测 110 条），
+所以 `stream()` 只在模型名**第一次出现**时发一条。
+
+@doc 对应实现：`client.py`（_events_from_chunk / _create / stream 里的 model 去重）
+
+---
+
+## 6.1 工具调用也是流式的，而且一个字符一个 chunk
+
+给 `deepseek-flash` 带上 `tools` 参数后，本机真跑的返回形状如下（流式）：
+
+```
+第 1 个分片  {"index": 0, "id": "call_00_xxx", "type": "function",
+              "function": {"name": "crop_region", "arguments": ""}}
+第 2..N 分片 {"index": 0, "id": null, "type": null,
+              "function": {"name": null, "arguments": "<一个字符>"}}
+最后一个分片 {"delta": {"content": ""}, "finish_reason": "tool_calls"}
+```
+
+要点：
+
+1. **id 与函数名只在第一个分片里**，之后全是 `null`。累积时用后到的 null 覆盖会丢字段。
+2. `arguments` 是**增量**、而且碎得离谱：一次 `{"name": "红色圆形", "x1": 0.13, ...}`
+   实测被拆成 47 个 chunk（一个字符一个），**必须按 `index` 自己拼**才能 `json.loads`。
+3. 多工具并发时按 `index` 区分，分片可能交错到达，别假设某个工具的分片是连续的。
+4. 结束原因是 `tool_calls`（不是 `stop`），而且此时 `content` 常常是**空串** ——
+   有工具调用时正文为空是正常的，不能当成「空正文」报错（见第 5 节的 `EmptyResponseError`）。
+
+本库的处理：`client.stream()` 发 `{"type": "tool_call", "index", "id", "name", "arguments"}`
+事件（arguments 为增量）；`complete()` 用 `_accumulate_tool_calls` 按 index 拼回完整对象，
+放进 `ChatReply.tool_calls`，并跳过「空正文」检查。
+`tools` / `tool_choice` 由调用方原样透传 —— **本库不声明工具、也不执行工具**。
+
+@doc 对应实现：`client.py`（_tool_call_events / _accumulate_tool_calls）、`locate.py`（use_tools 的报错文案）
 
 ---
 

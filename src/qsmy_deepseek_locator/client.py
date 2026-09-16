@@ -1,8 +1,14 @@
 """模型客户端：拼报文 + 流式收包，把 DeepSeek 的细节挡在这一层里。
 
-对外只有两个东西：
-    ChatReply                     一次调用的完整结果（正文 / 思考 / usage / 结束原因）
+对外有三个东西：
+    ChatReply                     一次调用的完整结果（正文 / 思考 / 工具调用 / usage / 结束原因）
     DeepSeekVisionClient.complete 收完整个流，返回 ChatReply（可选 on_event 回调看进度）
+    DeepSeekVisionClient.stream   逐段产出事件（最细的一层，自己收自己拼）
+
+三层粒度（一条龙 locate_to_file / 结构化+进度 locate / 只要事件流）见
+@doc README.md#7-看过程流式事件
+（该文档解决"想实时看思考、正文、工具调用时该调哪个入口"的问题。）
+可跑示例：examples/stream_events.py。
 
 为什么**永远走流式**（哪怕调用方只想要最终文本）：
     1. 思考模型先吐 reasoning_content 再吐 content，非流式时这段时间是完全静默的，
@@ -40,7 +46,10 @@ from typing import Any, Callable, Iterator, Protocol
 from .config import REASONING_EFFORTS, IMAGE_DETAILS, Settings
 from .errors import APIError, EmptyResponseError
 
-# 事件回调签名：on_event({"type": "reasoning"|"content"|"finish", ...})
+# 事件回调签名：六种事件，字段见 DeepSeekVisionClient.stream() 的 docstring。
+#   reasoning / content  模型在想什么、写了什么（片段）
+#   tool_call            模型要调哪个工具、参数拼到哪了（片段）
+#   finish / usage / model  结束原因、用量、服务端实际使用的模型名
 EventCallback = Callable[[dict], None]
 
 
@@ -53,6 +62,9 @@ class ChatReply:
     model: str = ""
     finish_reason: str | None = None
     usage: dict | None = None
+    # 模型请求调用的工具（OpenAI 格式，已按 index 拼回完整对象）；没调工具就是空列表。
+    # 这个字段非空时 text 通常就是空串 —— 那是「模型把话全说在工具调用里了」，
+    # 不是模型抽风，所以 complete() 不会把它当成空正文报错。
     tool_calls: list[dict] = field(default_factory=list)
 
     @property
@@ -146,10 +158,20 @@ def build_messages(
     return messages
 
 
-def build_request(settings: Settings, messages: list[dict], *, stream: bool = True) -> dict:
+def build_request(
+    settings: Settings,
+    messages: list[dict],
+    *,
+    stream: bool = True,
+    tools: list[dict] | None = None,
+    tool_choice: str | dict | None = None,
+) -> dict:
     """拼出 chat.completions.create 的关键字参数（不含客户端本身）。
 
     单独抽出来是为了让自测能直接断言「报文长什么样」，不用打桩整个 SDK。
+
+    tools / tool_choice 是**原样透传**给服务端的：本库不校验工具 schema，
+    也不替你执行工具（那是调用方的事，见 stream() 的 docstring）。传了才会带上这两个字段。
     """
     enabled, effort = resolve_thinking(settings, None, None)
     kwargs: dict[str, Any] = {
@@ -157,6 +179,10 @@ def build_request(settings: Settings, messages: list[dict], *, stream: bool = Tr
         "messages": messages,
         "stream": stream,
     }
+    if tools:
+        kwargs["tools"] = tools
+    if tool_choice:
+        kwargs["tool_choice"] = tool_choice
     extra = thinking_payload(enabled)
     if extra is not None:
         kwargs["extra_body"] = extra
@@ -228,16 +254,50 @@ class DeepSeekVisionClient:
         *,
         settings: Settings | None = None,
         stream: bool = True,
+        tools: list[dict] | None = None,
+        tool_choice: str | dict | None = None,
     ) -> Iterator[dict]:
-        """逐段产出事件：{"type": "reasoning"|"content"|"finish"|"usage", ...}。"""
+        """逐段产出事件（生成器）。六种事件与各自的字段：
+
+            {"type": "reasoning", "text": str}                 思考内容的一个片段
+            {"type": "content",   "text": str}                 正文的一个片段
+            {"type": "tool_call", "index": int,                工具调用的一个片段
+                                  "id": str | None,            首个分片才有 id 和函数名
+                                  "name": str | None,
+                                  "arguments": str}            参数的**增量**，不是完整 JSON
+            {"type": "finish",    "reason": str}               结束原因 stop / length / tool_calls
+            {"type": "usage",     "usage": dict}               用量（只在最后一个 chunk，可能要不到）
+            {"type": "model",     "model": str}                服务端实际使用的模型名
+
+        这是全库最细的一层：想边收边显示（思考 / 正文 / 工具调用分栏、实时打字机效果），
+        直接用这个生成器，或者给 complete() / locate() 传 on_event —— 两条路拿到的是同一批事件。
+
+        三个必须知道的点：
+        - text 类片段的**切分是任意的**（按 token 而非按字/句），拼起来才是完整内容；
+        - tool_call 的 arguments 同理，且流式下一个字符就是一个 chunk，
+          要拿到可 json.loads 的完整参数必须按 index 自己拼（complete() 已经帮你拼好）；
+        - usage 可能永远不来（个别兼容服务不认 stream_options），别等它。
+        """
         effective = settings or self.settings
-        kwargs = build_request(effective, messages, stream=stream)
+        kwargs = build_request(
+            effective, messages, stream=stream, tools=tools, tool_choice=tool_choice
+        )
         raw = self._create(kwargs, effective)
         if not stream:
             yield from _events_from_completion(raw)
             return
+        last_model: str | None = None
         for chunk in raw:
-            yield from _events_from_chunk(chunk)
+            for event in _events_from_chunk(chunk):
+                # 服务端在**每一个** chunk 上都带 model 字段。照单全收的话，
+                # 一次调用会甩出上百条一模一样的 model 事件，把 on_event 刷屏
+                # （第一次跑 examples/stream_events.py 就是这么发现的）。
+                # 模型名不会中途改变，因此只在第一次出现时发一条。
+                if event.get("type") == "model":
+                    if event.get("model") == last_model:
+                        continue
+                    last_model = event.get("model")
+                yield event
 
     def complete(
         self,
@@ -245,24 +305,33 @@ class DeepSeekVisionClient:
         *,
         settings: Settings | None = None,
         on_event: EventCallback | None = None,
+        tools: list[dict] | None = None,
+        tool_choice: str | dict | None = None,
     ) -> ChatReply:
         """收完整个流，返回 ChatReply。
 
         settings 为**本次调用**的配置覆盖（None = 用客户端自身配置）。
+        tools 原样透传给服务端，模型要调用时结果落在 ChatReply.tool_calls；
+        **本方法不执行工具**，要不要跑、跑完怎么把结果发回去，都是调用方的事。
         """
         effective = settings or self.settings
         text_parts: list[str] = []
         reasoning_parts: list[str] = []
+        tool_acc: dict[int, dict] = {}
         finish_reason: str | None = None
         usage: dict | None = None
         model = effective.model
 
-        for event in self.stream(messages, settings=effective):
+        for event in self.stream(
+            messages, settings=effective, tools=tools, tool_choice=tool_choice
+        ):
             etype = event.get("type")
             if etype == "reasoning":
                 reasoning_parts.append(event["text"])
             elif etype == "content":
                 text_parts.append(event["text"])
+            elif etype == "tool_call":
+                _accumulate_tool_calls(tool_acc, event)
             elif etype == "finish":
                 finish_reason = event.get("reason") or finish_reason
             elif etype == "usage":
@@ -278,8 +347,11 @@ class DeepSeekVisionClient:
             model=model,
             finish_reason=finish_reason,
             usage=usage,
+            tool_calls=[tool_acc[index] for index in sorted(tool_acc)],
         )
-        if not reply.text.strip():
+        # 有工具调用时正文为空是**正常**的（模型把话都说在 tool_calls 里了，finish_reason
+        # 会是 tool_calls），不能按「空正文」报错；既没正文又没工具调用才是真出问题。
+        if not reply.text.strip() and not reply.tool_calls:
             raise EmptyResponseError(_empty_hint(reply))
         return reply
 
@@ -319,6 +391,60 @@ def _format_api_error(exc: Exception, settings: Settings) -> str:
     return f"{head}{detail}（原始异常：{type(exc).__name__}: {exc}）"
 
 
+def _tool_call_events(tool_calls: Any) -> Iterator[dict]:
+    """把 tool_calls 拆成 {"type": "tool_call", ...} 事件。
+
+    ⚠️ 流式下的工具调用是**逐字符**吐的（实测 deepseek-flash 会把 `{"city": "北京"}`
+    拆成十几个 chunk，一个 chunk 一个字符；换成本库那个 crop_region 工具则是 47 个分片）：
+    第一个分片带 id 与函数名，之后每个分片只带 arguments 的一小段，
+    最后一个分片同时带 finish_reason="tool_calls"。
+    所以事件里的 arguments 是**增量**，要拿到完整参数得自己按 index 拼
+    —— complete() 里的 _accumulate_tool_calls 干的就是这件事。
+
+    @doc docs/API-NOTES.md#61-工具调用也是流式的而且一个字符一个-chunk
+    （该文档解决"分片的字段为什么后面会变 null、finish_reason 为什么是 tool_calls"的问题。）
+
+    非流式响应走的是同一个函数：那时 arguments 已经是完整串、index 是 None，
+    这里用列表下标补上，于是两条路径的累积逻辑可以完全一样。
+    """
+    if not tool_calls:
+        return
+    for position, call in enumerate(tool_calls):
+        index = getattr(call, "index", None)
+        call_id = getattr(call, "id", None)
+        function = getattr(call, "function", None)
+        name = getattr(function, "name", None) if function is not None else None
+        arguments = getattr(function, "arguments", None) if function is not None else None
+        if call_id is None and name is None and not arguments:
+            continue  # 全空占位分片（有些服务会发），不发事件
+        yield {
+            "type": "tool_call",
+            "index": position if index is None else index,
+            "id": call_id,
+            "name": name,
+            "arguments": arguments or "",
+        }
+
+
+def _accumulate_tool_calls(acc: dict[int, dict], event: dict) -> None:
+    """把 tool_call 事件按 index 拼成完整的工具调用对象（原地修改 acc）。
+
+    合并规则：id / name 只在第一次出现时记下（后面对应字段是 null，别用 null 覆盖掉），
+    arguments 一律**追加**。
+    """
+    index = event.get("index", 0)
+    slot = acc.setdefault(index, {
+        "id": None,
+        "type": "function",
+        "function": {"name": None, "arguments": ""},
+    })
+    if event.get("id"):
+        slot["id"] = event["id"]
+    if event.get("name"):
+        slot["function"]["name"] = event["name"]
+    slot["function"]["arguments"] += event.get("arguments") or ""
+
+
 def _events_from_chunk(chunk: Any) -> Iterator[dict]:
     """把一个流式 chunk 拆成事件。
 
@@ -346,6 +472,9 @@ def _events_from_chunk(chunk: Any) -> Iterator[dict]:
     if content:
         yield {"type": "content", "text": content}
 
+    tool_calls = getattr(delta, "tool_calls", None) if delta is not None else None
+    yield from _tool_call_events(tool_calls)
+
     finish = getattr(choice, "finish_reason", None)
     if finish:
         yield {"type": "finish", "reason": finish}
@@ -369,6 +498,8 @@ def _events_from_completion(completion: Any) -> Iterator[dict]:
     content = getattr(message, "content", None) if message is not None else None
     if content:
         yield {"type": "content", "text": content}
+    tool_calls = getattr(message, "tool_calls", None) if message is not None else None
+    yield from _tool_call_events(tool_calls)
     finish = getattr(choices[0], "finish_reason", None)
     if finish:
         yield {"type": "finish", "reason": finish}
