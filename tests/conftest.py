@@ -41,8 +41,10 @@ class FakeClient:
         self.events = events
         self.calls: list[dict] = []
 
-    def complete(self, messages, *, settings=None, on_event=None):
-        self.calls.append({"messages": messages, "settings": settings})
+    def complete(self, messages, *, settings=None, on_event=None, log=None):
+        # log 是 v0.2 起的调试日志参数：本库**只在开启日志时**才传它，
+        # 所以假客户端收下它即可，不必真的写文件。
+        self.calls.append({"messages": messages, "settings": settings, "log": log})
         if on_event is not None and self.events:
             if self.reasoning:
                 on_event({"type": "reasoning", "text": self.reasoning[:4]})

@@ -52,3 +52,47 @@ class TestLocateCommand:
         code = main([str(tmp_path / "nope.png"), "-t", "猫", "--no-draw", "-q"])
         assert code == 1
         assert "不存在" in capsys.readouterr().err
+
+class TestDebugLogFlags:
+    """--log / --log-file 只做一件事：把路径塞进 locate()。真写文件由库负责（见 test_debuglog.py）。"""
+
+    def _stub_locator(self, monkeypatch):
+        """把 CLI 用的 Locator 换掉，好离线断言它收到了什么参数。"""
+        from qsmy_deepseek_locator import LocateResult
+
+        captured: dict = {}
+
+        class StubLocator:
+            def __init__(self, **kwargs):
+                captured["ctor"] = kwargs
+
+            def locate(self, image, target, **kwargs):
+                captured.update(kwargs)
+                return LocateResult()
+
+        monkeypatch.setattr("qsmy_deepseek_locator.cli.Locator", StubLocator)
+        return captured
+
+    def test_default_is_off(self, sample_png, monkeypatch):
+        captured = self._stub_locator(monkeypatch)
+        assert main([str(sample_png), "-t", "猫", "--no-draw", "-q"]) == 0
+        assert captured["log_file"] is None
+
+    def test_log_file_is_forwarded(self, sample_png, monkeypatch):
+        captured = self._stub_locator(monkeypatch)
+        code = main([str(sample_png), "-t", "猫", "--no-draw", "-q",
+                     "--log-file", "runs/logs/mine.jsonl"])
+        assert code == 0
+        assert captured["log_file"] == "runs/logs/mine.jsonl"
+
+    def test_log_auto_builds_a_timestamped_path(self, sample_png, monkeypatch):
+        captured = self._stub_locator(monkeypatch)
+        code = main([str(sample_png), "-t", "猫", "--no-draw", "-q", "--log"])
+        assert code == 0
+        path = captured["log_file"].replace("\\", "/")
+        assert path.startswith("runs/logs/qsml-") and path.endswith(".jsonl")
+
+    def test_log_path_is_announced_on_stderr(self, sample_png, monkeypatch, capsys):
+        self._stub_locator(monkeypatch)
+        main([str(sample_png), "-t", "猫", "--no-draw", "--log-file", "runs/logs/mine.jsonl"])
+        assert "调试日志：runs/logs/mine.jsonl" in capsys.readouterr().err

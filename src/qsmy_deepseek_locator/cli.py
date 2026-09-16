@@ -23,6 +23,7 @@ from typing import Any, Sequence
 
 from . import __version__
 from .config import IMAGE_DETAILS, REASONING_EFFORTS
+from .debuglog import default_log_path
 from .errors import LocatorError
 from .locate import Locator, LocateResult
 
@@ -114,6 +115,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--timeout", type=float, default=None, help="单次请求超时（秒）")
     parser.add_argument("--max-side", type=int, default=None, help="发送前把图缩到最长边不超过该值")
     parser.add_argument("--system-prompt", default=None, help="覆盖系统提示词（承载坐标口径，慎改）")
+    parser.add_argument("--log-file", dest="log_file", default=None, metavar="PATH",
+                        help="把网络层请求体/响应体写成 JSONL 调试日志（默认不开）")
+    parser.add_argument("--log", dest="log_auto", action="store_true",
+                        help="开调试日志，路径自动取 runs/logs/qsml-<时间戳>.jsonl")
     parser.add_argument("--show-reasoning", action="store_true", help="把思考过程实时打到 stderr")
     parser.add_argument("--show-text", action="store_true", help="把模型正文实时打到 stderr")
     parser.add_argument("-q", "--quiet", action="store_true", help="不打印任何进度")
@@ -135,11 +140,17 @@ def locate_main(argv: Sequence[str]) -> int:
         max_side=args.max_side,
     )
 
+    log_file = args.log_file or (str(default_log_path()) if args.log_auto else None)
+    if not args.quiet and log_file:
+        # 先说日志写到哪，再干活：这次的输出就是给人「照着文件去翻」用的
+        sys.stderr.write(f"调试日志：{log_file}\n")
+
     try:
         result = locator.locate(
             args.image,
             args.target,
             prompt=args.prompt,
+            log_file=log_file,
             on_event=_make_progress(args.quiet, args.show_reasoning, args.show_text),
         )
     except LocatorError as exc:

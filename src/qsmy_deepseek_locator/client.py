@@ -43,7 +43,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterator, Protocol
 
-from .config import REASONING_EFFORTS, IMAGE_DETAILS, Settings
+from .config import REASONING_EFFORTS, IMAGE_DETAILS, Settings, redacted
+from .debuglog import DebugLog
 from .errors import APIError, EmptyResponseError
 
 # 事件回调签名：六种事件，字段见 DeepSeekVisionClient.stream() 的 docstring。
@@ -85,8 +86,12 @@ class VisionClient(Protocol):
         *,
         settings: "Settings | None" = None,
         on_event: EventCallback | None = None,
+        log: DebugLog | None = None,
     ) -> ChatReply:
         ...
+
+    # 注：log **只在开启日志时**才会被传进来（见 locate.py 里的 _call_kwargs）。
+    # 这样自备客户端、自己实现了本协议的老代码，不用日志功能时完全不受影响。
 
 
 # --------------------------------------------------------------------------- #
@@ -256,6 +261,7 @@ class DeepSeekVisionClient:
         stream: bool = True,
         tools: list[dict] | None = None,
         tool_choice: str | dict | None = None,
+        log: DebugLog | None = None,
     ) -> Iterator[dict]:
         """逐段产出事件（生成器）。六种事件与各自的字段：
 
@@ -277,27 +283,32 @@ class DeepSeekVisionClient:
         - tool_call 的 arguments 同理，且流式下一个字符就是一个 chunk，
           要拿到可 json.loads 的完整参数必须按 index 自己拼（complete() 已经帮你拼好）；
         - usage 可能永远不来（个别兼容服务不认 stream_options），别等它。
+
+        log 给 DebugLog 时，请求体、每个事件、以及任何异常都会追进那个日志文件
+        （见 debuglog.py）。**直接调用本方法时不会写 reply/result 行** ——
+        那两行需要「一次调用已经结束」或「解析结果」才知道，分别由 complete() 与 locate() 写。
         """
         effective = settings or self.settings
         kwargs = build_request(
             effective, messages, stream=stream, tools=tools, tool_choice=tool_choice
         )
-        raw = self._create(kwargs, effective)
-        if not stream:
-            yield from _events_from_completion(raw)
-            return
-        last_model: str | None = None
-        for chunk in raw:
-            for event in _events_from_chunk(chunk):
-                # 服务端在**每一个** chunk 上都带 model 字段。照单全收的话，
-                # 一次调用会甩出上百条一模一样的 model 事件，把 on_event 刷屏
-                # （第一次跑 examples/stream_events.py 就是这么发现的）。
-                # 模型名不会中途改变，因此只在第一次出现时发一条。
-                if event.get("type") == "model":
-                    if event.get("model") == last_model:
-                        continue
-                    last_model = event.get("model")
+        if log is not None:
+            # 请求体在**发出去之前**落盘：这样即使请求打不通，日志里也有完整报文可看。
+            # 图片 data URL 会被 debuglog 换成占位符，API Key 由 redacted() 脱敏。
+            log.write("request", {"settings": redacted(effective), "body": kwargs})
+        try:
+            raw = self._create(kwargs, effective)
+            events = (
+                _events_from_completion(raw) if not stream else _stream_events(raw, log)
+            )
+            for event in events:
+                if log is not None:
+                    log.write("event", event)
                 yield event
+        except Exception as exc:  # noqa: BLE001 - 记一笔原样抛，异常类型不在这里改写
+            if log is not None:
+                log.write("error", {"type": type(exc).__name__, "message": str(exc)})
+            raise
 
     def complete(
         self,
@@ -307,12 +318,15 @@ class DeepSeekVisionClient:
         on_event: EventCallback | None = None,
         tools: list[dict] | None = None,
         tool_choice: str | dict | None = None,
+        log: DebugLog | None = None,
     ) -> ChatReply:
         """收完整个流，返回 ChatReply。
 
         settings 为**本次调用**的配置覆盖（None = 用客户端自身配置）。
         tools 原样透传给服务端，模型要调用时结果落在 ChatReply.tool_calls；
         **本方法不执行工具**，要不要跑、跑完怎么把结果发回去，都是调用方的事。
+        log 给 DebugLog 时，除了 stream() 那些行，还会追一条 reply（完整响应体）
+        与一条 error（空正文这类失败）。
         """
         effective = settings or self.settings
         text_parts: list[str] = []
@@ -323,7 +337,7 @@ class DeepSeekVisionClient:
         model = effective.model
 
         for event in self.stream(
-            messages, settings=effective, tools=tools, tool_choice=tool_choice
+            messages, settings=effective, tools=tools, tool_choice=tool_choice, log=log
         ):
             etype = event.get("type")
             if etype == "reasoning":
@@ -349,10 +363,16 @@ class DeepSeekVisionClient:
             usage=usage,
             tool_calls=[tool_acc[index] for index in sorted(tool_acc)],
         )
+        if log is not None:
+            # 响应体：拼好的完整结果（正文 / 思考 / 工具调用 / usage / 结束原因）。
+            log.write("reply", reply)
         # 有工具调用时正文为空是**正常**的（模型把话都说在 tool_calls 里了，finish_reason
         # 会是 tool_calls），不能按「空正文」报错；既没正文又没工具调用才是真出问题。
         if not reply.text.strip() and not reply.tool_calls:
-            raise EmptyResponseError(_empty_hint(reply))
+            hint = _empty_hint(reply)
+            if log is not None:
+                log.write("error", {"type": "EmptyResponseError", "message": hint})
+            raise EmptyResponseError(hint)
         return reply
 
 
@@ -443,6 +463,26 @@ def _accumulate_tool_calls(acc: dict[int, dict], event: dict) -> None:
     if event.get("name"):
         slot["function"]["name"] = event["name"]
     slot["function"]["arguments"] += event.get("arguments") or ""
+
+
+def _stream_events(chunks: Any, log: DebugLog | None) -> Iterator[dict]:
+    """把 chunk 流拆成事件，并顺手（可选）把**原始 chunk** 也记进日志。
+
+    model 去重放在这里：服务端在**每一个** chunk 上都带 model 字段，照单全收的话
+    一次调用会甩出上百条一模一样的 model 事件，把 on_event 刷屏
+    （第一次跑 examples/stream_events.py 就是这么发现的）。模型名不会中途改变，
+    因此只在第一次出现时发一条。
+    """
+    last_model: str | None = None
+    for chunk in chunks:
+        if log is not None and log.chunks:
+            log.write("chunk", chunk)
+        for event in _events_from_chunk(chunk):
+            if event.get("type") == "model":
+                if event.get("model") == last_model:
+                    continue
+                last_model = event.get("model")
+            yield event
 
 
 def _events_from_chunk(chunk: Any) -> Iterator[dict]:

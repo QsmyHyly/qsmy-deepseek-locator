@@ -44,6 +44,7 @@ from .client import (
     build_messages,
 )
 from .config import Settings
+from .debuglog import coerce_log
 from .drawing import resolve_output_path
 from .errors import LocatorError
 from .images import describe_source, source_size, to_data_url
@@ -267,6 +268,7 @@ class Locator:
         max_side: int | None = None,
         client: VisionClient | None = None,
         on_event: EventCallback | None = None,
+        log_file: Any = None,
     ) -> LocateResult:
         """定位一张图里的目标。
 
@@ -280,8 +282,16 @@ class Locator:
             image_detail: 图片精度 low/high/original/auto（默认不带该字段）。
             max_tokens: 输出上限（含思考 token，留空用服务端默认）。
             max_side: 本次发送的缩放上限（覆盖构造参数）。
-            client: 本次调用换用别的客户端。
+            client: 本次调用换用别的客户端（给了它就要能接受 log 关键字参数，见下）。
             on_event: 流式事件回调，形如 on_event({"type": "reasoning"|"content"|...})。
+            log_file: 调试日志。None = 按配置/环境变量（QSML_LOG_FILE），False = **明确关闭**，
+                路径 = 写到该文件（JSONL，追加），True = 自动路径。见 debuglog.py。
+                日志记的是网络层：请求体（图片 data URL 已省略）、每个流式事件、
+                完整响应体、结构化结果、以及任何异常。**默认全程不开。**
+                @doc README.md#71-调试日志把请求体和响应体落盘
+                （该文档解决"日志里有什么、怎么读、什么该记什么不该记"的问题。）
+                自备 client 时：本库只在日志开启时才会把 log 传给它，所以不用日志的老客户端
+                不受影响；一旦开了日志，那个客户端就得接受 log 关键字参数（VisionClient 协议已含）。
 
         Returns:
             LocateResult。**模型没找到目标时不会抛异常**，而是返回 detections 为空的结果 ——
@@ -310,8 +320,16 @@ class Locator:
             image_detail=effective.image_detail,
         )
 
+        # 日志开关：单次参数 > 配置/环境变量。传 False 是一条**明确的关闭**通道，
+        # 用于盖掉环境变量里开着的日志（否则「临时不想记」只能改环境变量）。
+        log = coerce_log(log_file if log_file is not None else effective.log_file)
+        # 只在开启日志时才把 log 传下去：自备客户端不必为了不用日志而改签名。
+        log_kwarg = {"log": log} if log is not None else {}
+
         started = time.perf_counter()
-        reply = active_client.complete(messages, settings=effective, on_event=on_event)
+        reply = active_client.complete(
+            messages, settings=effective, on_event=on_event, **log_kwarg
+        )
         duration_ms = (time.perf_counter() - started) * 1000.0
 
         detections, warnings, raw_items = parse_detections(reply.text)
@@ -320,7 +338,7 @@ class Locator:
                 _EMPTY_ARRAY_NOTICE if _returned_empty_array(reply.text) else _NO_COORD_NOTICE
             )
 
-        return LocateResult(
+        result = LocateResult(
             detections=detections,
             text=reply.text,
             reasoning=reply.reasoning,
@@ -335,6 +353,11 @@ class Locator:
             image=describe_source(image),
             image_size=source_size(image),
         )
+        if log is not None:
+            # 结构化结果也留一份：正文/思考在 reply 行里已经有了，这里不重复，
+            # 只留解析出来的坐标与告警 —— 排查「模型答了但解析没跟上」时靠它。
+            log.write("result", result.to_dict(include_text=False, include_raw=True))
+        return result
 
     # ------------------------------------------------------------------ #
     def locate_and_draw(
@@ -383,6 +406,7 @@ class Locator:
         system_prompt: str | None = None,
         max_side: int | None = None,
         on_event: EventCallback | None = None,
+        log_file: Any = None,
         box_width: int = 3,
         point_radius: int = 5,
         font_size: int = 22,
@@ -433,6 +457,9 @@ class Locator:
             timeout: 单次请求超时（秒）。
             max_side: 发送前把图缩到最长边不超过它（归一化坐标不受影响，只省上行流量）。
             on_event: 流式事件回调，可拿来做进度显示。
+            log_file: 调试日志（请求体 / 事件流 / 响应体 / 结果 / 异常写成 JSONL）。
+                None = 按配置/环境变量，False = 明确关闭，路径 = 写到该文件，True = 自动路径。
+                **默认不开。** 日志记的是「发给模型什么、模型回了什么」，见 debuglog.py。
             box_width / point_radius / font_size / draw_label / colors: 绘制样式，见 drawing.draw。
 
         Returns:
@@ -475,6 +502,7 @@ class Locator:
             max_tokens=max_tokens,
             max_side=max_side,
             on_event=on_event,
+            log_file=log_file,
         )
 
         from .drawing import draw

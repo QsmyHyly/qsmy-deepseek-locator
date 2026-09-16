@@ -131,6 +131,10 @@ class Settings:
     # 输出上限，含思考 token。None = 不传。content 为空时优先怀疑它太小。
     max_tokens: int | None = None
     system_prompt: str = DEFAULT_SYSTEM_PROMPT
+    # 调试日志路径。None = 不开（默认），字符串 = 写到该文件（JSONL，追加）。
+    # 这里只收路径，别收 DebugLog 对象 —— Settings 是要能序列化、能比较的配置，
+    # 「日志写到哪」是配置，「日志对象怎么构造」不是。转换见 debuglog.coerce_log()。
+    log_file: str | None = None
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -147,6 +151,7 @@ class Settings:
             image_detail=_env_detail(),
             max_tokens=_env_int("QSML_MAX_TOKENS"),
             system_prompt=_env_str("QSML_SYSTEM_PROMPT") or DEFAULT_SYSTEM_PROMPT,
+            log_file=_env_str("QSML_LOG_FILE"),
         )
 
     def merged(self, **overrides: Any) -> "Settings":

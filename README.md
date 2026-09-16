@@ -43,7 +43,7 @@ pip install -e ".[dev]"
 
 依赖只有三个：`openai`（DeepSeek 走 OpenAI 兼容协议）、`Pillow`（读图 / 打标）、`requests`（下载图片 URL）。
 
-跑自测（150 个用例，**全程离线、不花 API**）：
+跑自测（175 个用例，**全程离线、不花 API**）：
 
 ```bash
 python -m pytest tests -q
@@ -131,6 +131,7 @@ qsmy-deepseek-locator photo.png -t "人" --print-json          # 只吐 JSON（�
 qsmy-deepseek-locator photo.png -t "人" --json r.json         # 连证据一起存盘
 qsmy-deepseek-locator photo.png -t "人" --no-thinking         # 关思考，更快
 qsmy-deepseek-locator photo.png --show-reasoning              # 实时看模型的思考过程
+qsmy-deepseek-locator photo.png -t "人" --log                 # 开调试日志（请求体/响应体，见 7.1）
 qsmy-deepseek-locator https://example.com/a.jpg -t "商品"     # 直接给 URL
 
 qsmy-deepseek-locator bench --count 5 --n-shapes 3            # 跑准确率评测（见第 5 节）
@@ -291,6 +292,46 @@ python examples/stream_events.py --raw      # 事件的 JSON 原样打印
 是调用方的事。`Locator.locate` 这一路不带 `tools`，所以它不会有 `tool_call` 事件；
 `use_tools=True` 依旧直接抛 `NotImplementedError`（v0.1 没有 Agent 循环）。
 
+### 7.1 调试日志：把请求体和响应体落盘
+
+上面那套事件是「实时看」，调试日志是「事后查」—— 它把**网络层**的报文与响应写成
+一行一个 JSON 的文件（JSONL）。**默认全程关闭**，一行参数开启：
+
+```python
+locate("photo.png", "红色圆形", log_file="runs/logs/run.jsonl")
+```
+
+四种开法（越靠前越优先）：`log_file=` 参数 / `Locator(log_file=...)` / 环境变量
+`QSML_LOG_FILE` / CLI 的 `--log-file PATH`（`--log` 则自动落到
+`runs/logs/qsml-<时间戳>.jsonl`）。`log_file=False` 是**明确关闭**，用来盖掉环境变量里开着的日志。
+
+一次调用会写下这些行：
+
+| `event` | 内容 |
+|---|---|
+| `request` | 完整请求体（messages、stream 参数、tools…）+ 脱敏后的配置 |
+| `event` | 每个流式事件（思考 / 正文 / 工具调用 / …），与 `on_event` 收到的是同一批 |
+| `chunk` | 原始 chunk —— **只在 `DebugLog(path, chunks=True)` 时有** |
+| `reply` | 拼好的完整响应体（正文 / 思考 / 工具调用 / usage / 结束原因） |
+| `result` | 解析后的结构化结果（坐标、告警、原始项） |
+| `error` | 任何异常（含空正文那类），原样抛出前先记一笔 |
+
+两条安全线：
+
+- **图片不进日志**。报文里的 data URL 会被换成 `data:image/png;base64,（省略 N 字符）`，
+  只保留「类型 + 体积」—— 否则一张 1200x900 的图就是几百 KB base64，日志比图还大且没法读。
+- **API Key 不进日志**。配置行走 `config.redacted()` 脱敏，只留首尾几位。
+
+⚠️ 除此之外日志里**有完整的模型输入输出**（提示词、思考过程、坐标），适合自己排查，
+别默认往公共 CI artifact 或别人的机器上丢。日志写失败不影响识别（只往 stderr 提醒一次）。
+
+要连原始 chunk 一起记（排查「服务端是不是发了奇怪的字段」），自己构造对象传进去：
+
+```python
+from qsmy_deepseek_locator import DebugLog
+locate("photo.png", "红色圆形", log_file=DebugLog("runs/logs/full.jsonl", chunks=True))
+```
+
 ---
 
 ## 8. 常见问题
@@ -336,6 +377,11 @@ A：有，见第 7 节。一句话版：给 `locate` / `locate_to_file` 传 `on_
 或者用最细的一层 `DeepSeekVisionClient().stream(messages)`。
 现成可跑的示例是 `examples/stream_events.py`（加 `--tools` 演示工具调用分片，加 `--raw` 打事件 JSON）。
 
+**Q：出问题了，想看到底发出去什么、模型回了什么？**
+A：开调试日志，见 7.1 节：`locate("photo.png", "红色圆形", log_file="runs/logs/run.jsonl")`，
+或 CLI 加 `--log`。请求体、流式事件、完整响应体、解析结果、异常都会写成 JSONL；
+图片 data URL 会省略成占位符，API Key 会脱敏。**默认不开。**
+
 **Q：模型要调用工具时，本库会替我执行吗？**
 A：**不会**。`tools` 原样透传、调用请求拼好放在 `ChatReply.tool_calls`，到这儿为止 ——
 执行工具、把结果发回去、决定要不要再来一轮，全是调用方的事。
@@ -347,7 +393,8 @@ A：**不会**。`tools` 原样透传、调用请求拼好放在 `ChatReply.tool
   代码里凡是为某条坑做了特殊处理的地方，都用 `@doc docs/API-NOTES.md#<锚点>` 指回对应小节。
 - 其余说明按「文档就近写在代码里」的原则放在模块头注释：
   `prompts.py`（提示词为什么这么写）、`parsing.py`（刻度兜底与为何不猜）、
-  `images.py`（编码策略）、`drawing.py`（中文字体）、`benchmark.py`（评测口径）。
+  `images.py`（编码策略）、`drawing.py`（中文字体）、`benchmark.py`（评测口径）、
+  `debuglog.py`（调试日志记什么、为什么不记图片）。
 
 ## 10. 与 `deepseek-vision-annotation` 的关系
 

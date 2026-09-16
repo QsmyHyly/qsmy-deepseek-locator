@@ -20,6 +20,13 @@
        但对库是危险的：用户会拿着假坐标当真结果。
     2. **坐标只有一种口径：0.0~1.0 相对比例，小数位不设上限**。0~1000 旧刻度会被自动
        除以 1000 换算并留下告警，像素坐标则一律告警而不猜测 —— 详见 parsing.py 的模块说明。
+
+想看「到底发出去什么、模型回了什么」，给任何入口传 log_file（**默认不开**）：
+
+    locate("photo.png", "红色圆形", log_file="runs/logs/run.jsonl")
+
+请求体 / 事件流 / 响应体 / 解析结果 / 异常会写成一行一个 JSON 的 JSONL 文件，
+读法与取舍见 debuglog.py 的模块说明。
 """
 
 from importlib.metadata import PackageNotFoundError, version as _version
@@ -39,6 +46,7 @@ from .config import (
     REASONING_EFFORTS,
     Settings,
 )
+from .debuglog import DebugLog, coerce_log, default_log_path
 from .drawing import (
     COLORS,
     coerce_detections,
@@ -99,6 +107,10 @@ __all__ = [
     "DEFAULT_TIMEOUT",
     "REASONING_EFFORTS",
     "IMAGE_DETAILS",
+    # 调试日志（默认关闭）
+    "DebugLog",
+    "coerce_log",
+    "default_log_path",
     # 图片
     "load_image",
     "to_data_url",
