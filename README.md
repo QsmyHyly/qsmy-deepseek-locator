@@ -33,6 +33,12 @@ pip install -e ".[dev]"
 
 依赖只有三个：`openai`（DeepSeek 走 OpenAI 兼容协议）、`Pillow`（读图 / 打标）、`requests`（下载图片 URL）。
 
+跑自测（101 个用例，**全程离线、不花 API**）：
+
+```bash
+python -m pytest tests -q
+```
+
 ## 2. 配 API Key
 
 ```bash
@@ -125,12 +131,17 @@ d.to_pixels(1920, 1080)   # {'bbox_px': (...), 'point_px': None, 'center_px': (.
 改一句话就是 60 个百分点，所以「改完提示词到底变好没有」必须能自动判分：
 
 ```bash
-qsmy-deepseek-locator bench --count 5 --n-shapes 3 --annotate
-# 图片 5 张 | 真值 15 个 | 预测 15 个
-# 检出率 100.0%（15/15）   精确率 100.0%   平均 IoU 0.897
-# 标签准确率 100.0%（颜色 100.0% / 形状 100.0%）
-# 平均耗时 4.2s/张   带告警的图片 0 张
+$ qsmy-deepseek-locator bench --count 5 --n-shapes 3 --annotate
+图片与真值：runs/benchmark/images
+图片 5 张 | 真值 15 个 | 预测 15 个
+检出率 100.0%（15/15）   精确率 100.0%   平均 IoU 0.874
+标签准确率 100.0%（颜色 100.0% / 形状 100.0%）
+平均耗时 2.3s/张   带告警的图片 0 张
+报告：runs/benchmark/report.json
 ```
+
+（上面这段是本库的实跑输出：`deepseek-flash`、思考开启、默认参数、种子 42。
+换成 `--no-thinking` 会更快 —— 另一轮 2 张图的实测是 1.8s/张、平均 IoU 0.915，准确率不掉。）
 
 它用代码生成「已知答案」的几何图形图，真值顺手算出来，再按 IoU（阈值 0.5）匹配预测框。
 产物落在 `runs/benchmark/`：`images/`（图 + `ground_truth.json`）、`annotated/`（预测画回图）、`report.json`。

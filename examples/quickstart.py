@@ -5,7 +5,8 @@
     python examples/quickstart.py                      # 用内置生成的示例图
     python examples/quickstart.py path/to/your.png "画面里的人"
 
-它会花一次 API 调用（联网、要花钱）。
+它会花一次 API 调用（联网、要花钱）。产物一律写进 runs/example/（已在 .gitignore 里），
+免得示例跑完在仓库里留下一堆没用的图。
 """
 
 from __future__ import annotations
@@ -16,6 +17,9 @@ from pathlib import Path
 from PIL import Image, ImageDraw
 
 from qsmy_deepseek_locator import Locator, draw, save_annotated
+
+# 产物目录：跟着 bench 的约定走 runs/（.gitignore 已忽略），示例跑完不会脏了仓库
+OUTPUT_DIR = Path("runs/example")
 
 
 def make_example_image(path: Path) -> Path:
@@ -30,13 +34,26 @@ def make_example_image(path: Path) -> Path:
     return path
 
 
-def _progress(event: dict) -> None:
-    """流式进度：只打阶段提示，别把几百个增量刷满屏。"""
-    kind = event.get("type")
-    if kind == "reasoning":
-        print(".", end="", flush=True)
-    elif kind == "content":
-        print("\n[正文] ", end="", flush=True)
+def _make_progress():
+    """构造流式进度回调：**每个阶段只打一次**提示。
+
+    模型的正文是一两百个小增量推过来的，逐个打印就会刷满一屏
+    （第一版就是这么写的，跑起来才发现）。状态记在闭包里，跨调用保持。
+    """
+    state = {"phase": ""}
+
+    def on_event(event: dict) -> None:
+        kind = event.get("type")
+        if kind == "reasoning" and state["phase"] != "reasoning":
+            state["phase"] = "reasoning"
+            print("[思考中…] ", end="", flush=True)
+        elif kind == "content" and state["phase"] != "content":
+            state["phase"] = "content"
+            print("\n[生成中…] ", end="", flush=True)
+        elif kind == "finish":
+            print()
+
+    return on_event
 
 
 def main(argv: list[str]) -> int:
@@ -44,7 +61,7 @@ def main(argv: list[str]) -> int:
         image = argv[0]
         target = argv[1] if len(argv) > 1 else None
     else:
-        image = str(make_example_image(Path("examples/example_input.png")))
+        image = str(make_example_image(OUTPUT_DIR / "input.png"))
         target = "几何图形"
 
     # thinking=False：关掉思考模式，更快更省 token（定位类任务实测不掉准确率）
@@ -52,7 +69,7 @@ def main(argv: list[str]) -> int:
 
     print(f"图片：{image}")
     print(f"提问：{target or '（默认：识别主要物体）'}")
-    result = locator.locate(image, target, on_event=_progress)
+    result = locator.locate(image, target, on_event=_make_progress())
 
     print()
     print(result.describe())
@@ -63,11 +80,11 @@ def main(argv: list[str]) -> int:
     annotated = draw(image, result)
 
     # 2) 或者让库帮你落盘
-    saved = save_annotated(image, result, path="examples/example_annotated.png")
+    saved = save_annotated(image, result, path=OUTPUT_DIR / "annotated.png")
     print(f"标注图：{saved}（{annotated.width}x{annotated.height}）")
 
     # 3) 结构化结果也能直接存成 JSON（include_raw 连解析前的原始项一起留证）
-    json_path = result.save("examples/example_result.json", include_raw=True)
+    json_path = result.save(OUTPUT_DIR / "result.json", include_raw=True)
     print(f"结果 JSON：{json_path}")
     return 0
 
