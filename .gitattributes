@@ -1,0 +1,11 @@
+# 统一行尾：仓库内一律 LF。
+# 本机 core.autocrlf=true，不写这条的话每次提交都会刷一屏
+# "LF will be replaced by CRLF" 的噪音，而且同一文件会在不同机器上反复抖动。
+* text=auto eol=lf
+
+# 图片按二进制处理，别做任何行尾转换
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary

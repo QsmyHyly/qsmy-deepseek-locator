@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+.venv/
+venv/
+
+# 测试与缓存
+.pytest_cache/
+.coverage
+htmlcov/
+
+# 运行产物（评测图片 / 标注图 / 报告）
+runs/
+
+# 本机私有：API Key 与临时实验，绝不入库
+.env
+*.local.json
+scratch/
