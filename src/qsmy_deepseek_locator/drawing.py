@@ -217,4 +217,51 @@ def save_annotated(
     return target
 
 
-__all__ = ["draw", "save_annotated", "coerce_detections", "resolve_font", "COLORS"]
+# 标注图输出支持的扩展名 -> PIL 保存格式。
+# 认不出的扩展名一律报错而**不猜**：文件名写着 .jpg、内容却是 PNG 字节，
+# 是最难排查的一类问题（下游按后缀读图会直接报「不是 JPEG」）。
+_OUTPUT_FORMATS = {
+    ".png": "PNG",
+    ".jpg": "JPEG",
+    ".jpeg": "JPEG",
+    ".webp": "WEBP",
+    ".bmp": "BMP",
+    ".tif": "TIFF",
+    ".tiff": "TIFF",
+    ".gif": "GIF",
+}
+
+
+def resolve_output_path(output: str | Path | None) -> tuple[Path, str]:
+    """把用户给的输出路径规范化成 (Path, PIL 保存格式)。
+
+    - 带支持的扩展名（.png/.jpg/.jpeg/.webp/.bmp/.tif/.tiff/.gif）-> 用对应格式保存；
+    - 没写扩展名 -> 补 .png（画出来的默认就是 PNG），所以 output="out" 与 "out.png" 同义；
+    - 空路径 / 认不出的扩展名 -> ValueError，绝不偷偷换成别的格式。
+
+    大小写不敏感（.PNG 与 .png 等价，保存时显式给 format，不靠 PIL 猜后缀）。
+    """
+    if output is None or not str(output).strip():
+        raise ValueError("必须给标注图的输出路径（含文件名），例如 output='runs/out.png'")
+    path = Path(str(output))
+    suffix = path.suffix.lower()
+    if not suffix:
+        path = path.with_suffix(".png")
+        suffix = ".png"
+    fmt = _OUTPUT_FORMATS.get(suffix)
+    if fmt is None:
+        raise ValueError(
+            f"输出路径的扩展名 {suffix!r} 不支持：{path}\n"
+            f"支持 {'/'.join(sorted(_OUTPUT_FORMATS))}；不写扩展名则默认存成 .png。"
+        )
+    return path, fmt
+
+
+__all__ = [
+    "draw",
+    "save_annotated",
+    "coerce_detections",
+    "resolve_font",
+    "resolve_output_path",
+    "COLORS",
+]

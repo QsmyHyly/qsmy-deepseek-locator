@@ -3,12 +3,16 @@
 一句话：给它一张图和一句「找什么」，拿回 0.0~1.0 的归一化坐标（框 / 点）与中文名称，
 需要的话再把框和标签画回图上。
 
-最常用的四个名字：
+最常用的几个名字：
 
-    from qsmy_deepseek_locator import locate, draw, Locator, Detection
+    from qsmy_deepseek_locator import locate, locate_to_file, draw, Locator, Detection
 
-    result = locate("photo.png", "红色圆形")     # 一次调用
-    draw("photo.png", result).save("out.png")    # 打标出图
+    result = locate("photo.png", "红色圆形")     # 一次调用，拿坐标
+    draw("photo.png", result).save("out.png")    # 只想自己掌控绘制时
+
+    # 一行出图：图片 + 「找什么」+ 输出路径，回来时文件已经在了
+    result = locate_to_file("photo.png", "红色圆形", "runs/photo_annotated.png")
+    print(result.annotated_path)
 
 设计上刻意与「旧演示项目」不同的两点（对外承诺，别在后来的改动里悄悄破坏）：
 
@@ -34,7 +38,14 @@ from .config import (
     REASONING_EFFORTS,
     Settings,
 )
-from .drawing import COLORS, coerce_detections, draw, resolve_font, save_annotated
+from .drawing import (
+    COLORS,
+    coerce_detections,
+    draw,
+    resolve_font,
+    resolve_output_path,
+    save_annotated,
+)
 from .errors import (
     APIError,
     EmptyResponseError,
@@ -43,7 +54,7 @@ from .errors import (
     MissingAPIKeyError,
 )
 from .images import encode_data_url, load_image, source_size, to_data_url
-from .locate import LocateResult, Locator, locate
+from .locate import LocateResult, Locator, locate, locate_to_file
 from .parsing import (
     BBOX_FIELD,
     POINT_FIELD,
@@ -64,6 +75,7 @@ except PackageNotFoundError:  # 未安装（直接从源码 import）时的兜�
 __all__ = [
     # 核心
     "locate",
+    "locate_to_file",
     "Locator",
     "LocateResult",
     "Detection",
@@ -72,6 +84,7 @@ __all__ = [
     "save_annotated",
     "coerce_detections",
     "resolve_font",
+    "resolve_output_path",
     "COLORS",
     # 配置与客户端
     "Settings",

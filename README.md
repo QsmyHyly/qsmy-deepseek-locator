@@ -4,6 +4,16 @@
 > 拿回 **0.0~1.0 的归一化坐标**（框 / 点）与中文名称，需要的话直接把框和标签画回图上。
 
 ```python
+from qsmy_deepseek_locator import locate_to_file
+
+# 最省事：图片 + 「找什么」+ 输出路径，回来时标注图已经写好
+result = locate_to_file("photo.png", "红色圆形", "annotated.png")
+print(result.annotated_path, result.labels)     # annotated.png ['红色圆形']
+```
+
+要自己掌控坐标与绘制：
+
+```python
 from qsmy_deepseek_locator import locate, draw
 
 result = locate("photo.png", "红色圆形")
@@ -33,7 +43,7 @@ pip install -e ".[dev]"
 
 依赖只有三个：`openai`（DeepSeek 走 OpenAI 兼容协议）、`Pillow`（读图 / 打标）、`requests`（下载图片 URL）。
 
-跑自测（101 个用例，**全程离线、不花 API**）：
+跑自测（130 个用例，**全程离线、不花 API**）：
 
 ```bash
 python -m pytest tests -q
@@ -57,7 +67,39 @@ export DEEPSEEK_API_KEY="sk-你的key"
 
 ## 3. 三种用法
 
-### 3.1 一行式
+### 3.1 一行式出图（最省事）
+
+给「图片 + 找什么 + 输出路径」，函数回来时标注图已经躺在磁盘上了：
+
+```python
+from qsmy_deepseek_locator import locate_to_file
+
+result = locate_to_file("photo.png", "红色圆形", "runs/photo_annotated.png")
+print(result.annotated_path)   # runs/photo_annotated.png（没写扩展名会自动补 .png）
+print(result.labels)           # ['红色圆形']
+```
+
+可选参数（全部关键字，按需给）：
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `api_key` | 读 `DEEPSEEK_API_KEY` | **传了就只用它**，不再看环境变量 |
+| `thinking` | `False` | 默认显式关闭思考（实测不掉准确率、耗时约省一半）；传 `None` 交回环境变量决定 |
+| `image_detail` | `"original"` | `low/high/original/auto`；传 `None` 表示不发送该字段 |
+| `use_tools` | `False` | 工具（Agent）调用：v0.1 未实现，传 `True` 会**当场报错**而不是被静默忽略 |
+| `prompt` | `None` | 直接给**整段**用户消息（给了就忽略第二个位置参数 `target`）。⚠️ 它不会自动套上本库那句「请找出图中所有的…」包装句式，所以「找什么」请走 `target` |
+| `model` / `base_url` / `timeout` / `max_tokens` / `max_side` / `system_prompt` | 见第 6 节 | 与 `Locator.locate()` 同名同义 |
+| `colors` / `box_width` / `point_radius` / `font_size` / `draw_label` | 见 `drawing.draw` | 绘制样式 |
+
+几条已定好的行为，不必去猜：
+
+- **输出路径先校验、后调模型** —— 路径拼错不该等花掉一次 API 调用才发现；父目录会自动创建；
+- 扩展名决定格式（`.png/.jpg/.jpeg/.webp/.bmp/.tif/.tiff/.gif`），**认不出的后缀直接报错**，
+  绝不偷偷存成别的格式（文件名写着 `.jpg` 内容却是 PNG，是最难排查的一类问题）；
+- 模型没找到目标**照样出图**（内容等于原图），这不是失败，`result.detections` 为空而已；
+- 画的是**原图**，所以输出分辨率始终等于输入分辨率。
+
+### 3.2 一行式（只要坐标）
 
 ```python
 from qsmy_deepseek_locator import locate
@@ -66,7 +108,7 @@ result = locate("photo.png", "画面里的人")      # 本地路径 / URL / byte
 print(result.summary())                        # {'total': 3, 'bbox_count': 3, ...}
 ```
 
-### 3.2 复用定位器（多图批量时用这个）
+### 3.3 复用定位器（多图批量时用这个）
 
 ```python
 from qsmy_deepseek_locator import Locator, draw
@@ -78,9 +120,10 @@ for path in ["a.png", "b.png", "c.png"]:
     print(path, result.labels)
 ```
 
-`locate()` 每次都会重新读环境变量、新建客户端；批量场景请自己建 `Locator`。
+`locate()` / `locate_to_file()` 每次都会重新读环境变量、新建客户端；批量场景请自己建
+`Locator`，再调用它的 `locate()` 或 `locate_to_file()`（后者同样会把落盘路径写进 `result.annotated_path`）。
 
-### 3.3 命令行
+### 3.4 命令行
 
 ```bash
 qsmy-deepseek-locator photo.png -t "登录按钮"                 # 打印坐标 + 生成 photo_annotated.png
@@ -151,7 +194,20 @@ $ qsmy-deepseek-locator bench --count 5 --n-shapes 3 --annotate
 ## 6. API 速查
 
 ```python
-from qsmy_deepseek_locator import Locator, Detection, draw, save_annotated, __version__
+from qsmy_deepseek_locator import (
+    Locator, Detection, draw, save_annotated, locate_to_file, __version__,
+)
+
+# 一行式出图（模块级函数 = 建临时 Locator 再调下面的方法）
+result = locate_to_file(
+    "photo.png",           # 图片：路径 / URL / bytes / PIL.Image / data URL
+    "红色圆形",             # 找什么（target，就是那句用户提示词）
+    "out/annotated.png",   # 输出文件的完整路径（含文件名）
+    api_key=None,          # 传了就不读 DEEPSEEK_API_KEY
+    thinking=False,        # 默认显式关闭思考
+    image_detail="original",  # 默认 original；None = 不发送该字段
+    use_tools=False,       # v0.1 只能是 False
+)
 
 locator = Locator(
     api_key=None,          # 默认读 DEEPSEEK_API_KEY
@@ -180,6 +236,7 @@ result = locator.locate(
 | `result.detections` | `list[Detection]`，主数据；也可直接 `for d in result` |
 | `result.bboxes` / `.points` / `.labels` / `.centers` | 按类型取出的便捷视图 |
 | `result.find("红")` | 按标签子串筛 |
+| `result.annotated_path` | 标注图落盘路径；只有 `locate_to_file()` 会填，其余入口恒为 `None` |
 | `result.warnings` | 旧刻度换算 / 坐标越界 / 没解析到坐标等告警 |
 | `result.text` / `.reasoning` | 模型正文 / 思考过程（**证据**，排查时全靠它） |
 | `result.usage` / `.duration_ms` / `.model` | token 用量、耗时、实际模型 |
