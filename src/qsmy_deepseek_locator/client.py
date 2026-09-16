@@ -45,7 +45,7 @@ from typing import Any, Callable, Iterator, Protocol
 
 from .config import REASONING_EFFORTS, IMAGE_DETAILS, Settings, redacted
 from .debuglog import DebugLog
-from .errors import APIError, EmptyResponseError
+from .errors import APIError, EmptyResponseError, LocatorError
 
 # 事件回调签名：六种事件，字段见 DeepSeekVisionClient.stream() 的 docstring。
 #   reasoning / content  模型在想什么、写了什么（片段）
@@ -244,13 +244,31 @@ class DeepSeekVisionClient:
             return client.chat.completions.create(**kwargs)
         except Exception as exc:  # noqa: BLE001
             # 有些 OpenAI 兼容服务（含自建代理）不认 stream_options，会直接 400。
-            # 这只影响「能不能顺手拿到 usage」，不值得让整轮识别失败，所以去掉重试一次。
-            if "stream_options" in str(exc) and "stream_options" in kwargs:
+            # 这只影响「能不能顺手拿到 usage」，不值得让整轮识别失败，所以去掉它重试一次。
+            #
+            # 重试条件收窄到「HTTP 400（或拿不到状态码）+ 错误文本点名 stream_options」：
+            # 只看子串的话，连 500 / 401 这种根本不可能是「参数不认识」的错误也会被重发一次。
+            # 被拒的请求本身不产生模型开销，所以这不是钱的问题，而是**白等一个来回**、
+            # 并且让真正的错误（鉴权、超时）晚一轮才浮出来。
+            # status 为 None 时仍按老规矩试一次：个别自建服务抛的不是 SDK 的 HTTP 异常，
+            # 拿不到状态码，宁可多试一次也别把它们挡在门外。
+            status = getattr(exc, "status_code", None)
+            if (
+                "stream_options" in kwargs
+                and (status is None or status == 400)
+                and "stream_options" in str(exc)
+            ):
                 retry = {k: v for k, v in kwargs.items() if k != "stream_options"}
                 try:
                     return client.chat.completions.create(**retry)
                 except Exception as exc2:  # noqa: BLE001
-                    raise APIError(_format_api_error(exc2, settings)) from exc2
+                    # 两次都失败时把第一次也带上：重试后的报错常常只是同一个问题换个说法，
+                    # 只报第二次会让「到底哪里不对」这条线索断掉（实测：第一次 400 说不认
+                    # stream_options，第二次 401 说 Key 无效，只报后者会让人去查 Key）。
+                    raise APIError(
+                        f"{_format_api_error(exc2, settings)}"
+                        f"（去掉 stream_options 重试前的那次失败：{type(exc).__name__}: {exc}）"
+                    ) from exc2
             raise APIError(_format_api_error(exc, settings)) from exc
 
     def stream(
@@ -305,10 +323,17 @@ class DeepSeekVisionClient:
                 if log is not None:
                     log.write("event", event)
                 yield event
-        except Exception as exc:  # noqa: BLE001 - 记一笔原样抛，异常类型不在这里改写
+        except Exception as exc:  # noqa: BLE001 - 记一笔，再按本库的口径抛出去
             if log is not None:
                 log.write("error", {"type": type(exc).__name__, "message": str(exc)})
-            raise
+            # 流**中途**出错（服务端断连、读超时、流里回一个 error 事件）时，SDK 抛的是它
+            # 自己的异常类型，与本库的 APIError 不是同一个类；而调用方（含本库 CLI）都按
+            # LocatorError 兜底 —— 不在这里统一，用户拿到的是一个裸栈而不是「错误：…」。
+            # errors.py 里 APIError 的定义本来就写着「网络、鉴权、限流、服务端 5xx」，
+            # 这属于兑现那条承诺；原始异常挂在 __cause__ 上，没被吃掉。
+            if isinstance(exc, LocatorError):  # 已经是本库异常（如 _create 抛的）原样放行
+                raise
+            raise APIError(_format_api_error(exc, effective)) from exc
 
     def complete(
         self,

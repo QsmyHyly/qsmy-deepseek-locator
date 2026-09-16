@@ -214,3 +214,27 @@ class TestDraw:
         """认不出的后缀要报错，不能偷偷存成 PNG。"""
         with pytest.raises(ValueError):
             save_annotated(sample_png, [], path=tmp_path / "out.txt")
+    def test_label_pixels_really_change_the_image(self):
+        """draw_label=True 必须真的往图上写字，否则这个开关等于没接上。"""
+        img = Image.new("RGB", (200, 150), (255, 255, 255))
+        det = [Detection(label="猫", bbox=(0.2, 0.3, 0.8, 0.8))]
+        without = draw(img, det, draw_label=False).tobytes()
+        with_label = draw(img, det, draw_label=True).tobytes()
+        assert without != with_label
+
+    def test_inverted_box_draws_the_same_as_a_normal_one(self):
+        """反向框（x2<x1）要交换端点，而不是画出一片空白。"""
+        img = Image.new("RGB", (100, 100), (255, 255, 255))
+        normal = draw(img, [Detection(label="", bbox=(0.2, 0.2, 0.8, 0.8))])
+        inverted = draw(img, [Detection(label="", bbox=(0.8, 0.8, 0.2, 0.2))])
+        assert normal.tobytes() == inverted.tobytes()
+
+    def test_out_of_range_point_is_clamped_to_the_edge(self):
+        """越界点要夹到画布边缘，而不是画到画布外（那样用户看到的是一张白图）。"""
+        img = Image.new("RGB", (100, 100), (255, 255, 255))
+        out = draw(img, [Detection(label="", point=(5.0, 5.0))])
+        painted = [(x, y) for y in range(100) for x in range(100)
+                   if out.getpixel((x, y)) != (255, 255, 255)]
+        assert painted, "整张图一个像素都没改：越界点没被夹回画布"
+        # 夹紧后落在右下角（5.0 -> 1.0 -> 像素 100，圆心在画布外的角上）
+        assert min(x for x, _ in painted) >= 90 and min(y for _, y in painted) >= 90

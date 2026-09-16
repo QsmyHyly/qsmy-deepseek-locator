@@ -485,7 +485,16 @@ class Locator:
             )
 
         # 先校验输出路径再调模型：这是**故意**的顺序，一次 API 调用不该因为路径拼错而白花。
+        # 父目录也在这里一并建出来，而不是等画完再 mkdir：路径不可写（父级是个文件、
+        # 没有写权限）属于「本地输入问题」，不该花掉一次 API 调用才暴露；
+        # 而且裸 OSError 不是 LocatorError，调用方的 except LocatorError 抓不住它。
         path, fmt = resolve_output_path(output)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise LocatorError(
+                f"输出目录无法使用：{path.parent}（{type(exc).__name__}: {exc}）"
+            ) from exc
 
         result = self.locate(
             image,
@@ -516,8 +525,7 @@ class Locator:
             draw_label=draw_label,
             colors=colors,
         )
-        path.parent.mkdir(parents=True, exist_ok=True)
-        annotated.save(path, format=fmt)
+        annotated.save(path, format=fmt)  # 父目录已在调模型之前建好，见上面那段注释
         result.annotated_path = str(path)
         return result
 

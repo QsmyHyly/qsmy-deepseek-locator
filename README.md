@@ -48,7 +48,7 @@ pip install -e ".[dev]"
 
 依赖只有三个：`openai`（DeepSeek 走 OpenAI 兼容协议）、`Pillow`（读图 / 打标）、`requests`（下载图片 URL）。
 
-跑自测（179 个用例，**全程离线、不花 API**）：
+跑自测（187 个用例，**全程离线、不花 API**）：
 
 ```bash
 python -m pytest tests -q
@@ -387,6 +387,12 @@ A：有，见第 7 节。一句话版：给 `locate` / `locate_to_file` 传 `on_
 或者用最细的一层 `DeepSeekVisionClient().stream(messages)`。
 现成可跑的示例是 `examples/stream_events.py`（加 `--tools` 演示工具调用分片，加 `--raw` 打事件 JSON）。
 
+**Q：异常该怎么兜？网络中途断了抛什么？**
+A：全都继承 `LocatorError`，`except LocatorError` 一把兜住即可，具体的子类见第 6 节。
+**流跑到一半**才断（服务端断连、读超时、流里回一个 error 事件）也算 —— 本库会把它包成
+`APIError`，原始异常挂在 `__cause__` 上，不会丢。所以 CLI 那种「接口报错就退出码 1 加一句
+错误：…」的承诺，对中途失败同样成立。
+
 **Q：出问题了，想看到底发出去什么、模型回了什么？**
 A：开调试日志，见 7.1 节：`locate("photo.png", "红色圆形", log_file="runs/logs/run.jsonl")`，
 或 CLI 加 `--log`。请求体、流式事件、完整响应体、解析结果、异常都会写成 JSONL；
@@ -421,3 +427,28 @@ A：**不会**。`tools` 原样透传、调用请求拼好放在 `ChatReply.tool
 
 [MIT](https://github.com/QsmyHyly/qsmy-deepseek-locator/blob/main/LICENSE)。`docs/` 中的接口事实整理自 DeepSeek 官方文档与实际调用观测，
 以官方站点 <https://api-docs.deepseek.com> 为准。
+## 12. 已知限制
+
+发布前做过一轮逐文件的对抗性复审，下面这些是**确认存在、但 0.1.0 没有修**的。
+写在这里，免得你踩到了以为是自己的用法不对：
+
+- **`Locator(thinking=True)` 会被 `locate_to_file()` 的函数默认值盖掉。** 后者的默认值是
+  `thinking=False, image_detail="original"`（一行式入口图快），而它是**函数默认值**这一层，
+  于是会盖过构造时传的设置。想沿用构造参数就显式写 `thinking=None, image_detail=None`。
+  这是 0.1.0 里唯一一处「函数默认值赢了构造参数」的地方，与第 6 节写的优先级相反，计划在 0.2 改掉。
+- **整批坐标都 ≤1000 时会被当成 0~1000 旧口径除以 1000。** 如果模型真的按像素给坐标、
+  而图和坐标又都小于 1000，这一步会静默算错。结果里带 `image_size`，对不上就核对它；
+  这个换算是**整批**判定的，混着给（一部分 >1000、一部分没超）时也会整批按旧口径处理。
+- **输出被截断时，提示语指的是提示词，而不是输出预算。** `finish_reason == "length"`
+  且正文里没解析出坐标时，`warnings` 说的是「正文里没有可解析的坐标，可检查提示词」——
+  真实原因往往是思考 token 吃光了 `max_tokens`。看到这条时请一并调大 `max_tokens`
+  或关掉思考（`thinking=False`），别只改提示词。
+- **`max_side=None`（默认）时图片零重编码，因此不做图像内容校验。** 把一个非图片文件
+  （比如 `.png` 后缀的 HTML）喂进去，本库不会在本地拦下它，报错会来自服务端。
+  想严格拦截就传 `max_side=`（例如 `max_side=1600`），那条路径会真的解码图片。
+- **定位是「框出大概位置」，不是像素级分割。** 不做 NMS、不去重，同一个目标可能出现两个框；
+  框的精度受模型限制（每张图服务端只算 384 token）。
+- **0.1.0 没有 Agent / 工具执行循环。** `use_tools=True` 直接抛 `NotImplementedError`；
+  `client.complete(..., tools=[...])` 能拿到完整工具调用参数，但本库不替你执行。
+- **实测只跑过 CPython 3.11 与 3.12。** `requires-python = ">=3.9"` 是按语法静态核对的
+  （全部模块都有 `from __future__ import annotations`，没有 3.10+ 独有语法），没有真在 3.9 / 3.10 上跑过。

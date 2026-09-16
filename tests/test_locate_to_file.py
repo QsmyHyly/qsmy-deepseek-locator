@@ -12,7 +12,7 @@ import pytest
 from PIL import Image
 
 from qsmy_deepseek_locator import Locator, locate_to_file, resolve_output_path
-from qsmy_deepseek_locator.errors import MissingAPIKeyError
+from qsmy_deepseek_locator.errors import LocatorError, MissingAPIKeyError
 
 BOX = '[{"bbox_2d": [0.25, 0.25, 0.75, 0.75], "label": "蓝色方块"}]'
 
@@ -49,6 +49,19 @@ class TestLocateToFile:
         with Image.open(out) as img:
             assert img.size == (400, 300)          # 画的是原图分辨率
             assert img.getpixel((200, 75)) == (255, 0, 0)
+
+    def test_unusable_parent_dir_fails_before_the_model_is_called(self, fake_client, sample_png, tmp_path):
+        """输出目录不可用要在调模型之前就报错，而且得是 LocatorError。
+
+        把父路径先占成一个文件：旧实现要等画完才 mkdir，于是先花掉一次 API 调用，
+        抛的还是裸 OSError —— 调用方的 except LocatorError 根本抓不住。
+        """
+        blocker = tmp_path / "blocker"
+        blocker.write_text("not a directory", encoding="utf-8")
+        client = fake_client("[]")
+        with pytest.raises(LocatorError):
+            locate_to_file(sample_png, "找方块", blocker / "out.png", client=client)
+        assert client.calls == []          # 一次都没调模型
 
     def test_target_reaches_the_model(self, fake_client, sample_png, tmp_path):
         client = fake_client("[]")

@@ -14,6 +14,7 @@ import pytest
 from qsmy_deepseek_locator import DebugLog, Locator, Settings, locate
 from qsmy_deepseek_locator.client import DeepSeekVisionClient
 from qsmy_deepseek_locator.debuglog import _fallback, _plain, coerce_log, default_log_path
+from qsmy_deepseek_locator.errors import APIError
 
 REPLY = '[{"bbox_2d": [0.1, 0.2, 0.3, 0.4], "label": "红色圆形"}]'
 
@@ -142,11 +143,14 @@ def test_error_is_logged_then_reraised(tmp_path, sample_png, monkeypatch):
         raise RuntimeError("网络炸了")
 
     monkeypatch.setattr(client, "_create", boom)
-    with pytest.raises(RuntimeError, match="网络炸了"):
+    # 底层异常会被包成本库的 APIError，原始异常挂在 __cause__ 上：
+    # 调用方既能按 LocatorError 一把兜住，也还能拿到原始类型去查根因。
+    with pytest.raises(APIError, match="网络炸了") as excinfo:
         Locator(client=client).locate(sample_png, "圆形", log_file=path)
+    assert isinstance(excinfo.value.__cause__, RuntimeError)
     records = _read(path)
     assert _events(records) == ["request", "error"]  # 报文照样留下了
-    assert records[-1]["data"]["type"] == "RuntimeError"
+    assert records[-1]["data"]["type"] == "RuntimeError"  # 日志里记的是**原始**类型
 
 
 def test_env_var_turns_logging_on(tmp_path, sample_png, monkeypatch):

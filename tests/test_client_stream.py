@@ -27,7 +27,7 @@ from qsmy_deepseek_locator.client import (
     build_request,
 )
 from qsmy_deepseek_locator.config import Settings
-from qsmy_deepseek_locator.errors import EmptyResponseError
+from qsmy_deepseek_locator.errors import APIError, EmptyResponseError, LocatorError
 
 
 # --------------------------------------------------------------------------- #
@@ -258,3 +258,94 @@ def test_reasoning_and_text_still_accumulate(monkeypatch):
     reply = _client_with(monkeypatch, chunks).complete([{"role": "user", "content": "hi"}])
     assert (reply.reasoning, reply.text, reply.finish_reason) == ("想", "好的", "stop")
     assert reply.tool_calls == []
+
+# --------------------------------------------------------------------------- #
+# 请求失败路径：重试条件与异常类型（都属于「用户会看到什么」的问题）
+#
+# 这里的伪造层次比上面低一层：直接换掉 client_for 返回的 SDK 客户端，
+# 好让 _create 里那段「不认 stream_options 就退一步重试」的逻辑真的跑起来。
+# --------------------------------------------------------------------------- #
+class _FakeAPIError(Exception):
+    """模仿 openai SDK 的 HTTP 异常：有 status_code，文本里可能回显请求体。"""
+
+    def __init__(self, message, status_code=None):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+class _StubSDK:
+    """按顺序返回/抛出 outcomes 的假 SDK 客户端，同时记录每次 create 收到的 kwargs。"""
+
+    def __init__(self, outcomes, calls):
+        self._outcomes = outcomes
+        self._calls = calls
+        self.chat = NS(completions=NS(create=self._create))
+
+    def _create(self, **kwargs):
+        self._calls.append(kwargs)
+        outcome = self._outcomes[len(self._calls) - 1]
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+
+def _sdk_client_with(monkeypatch, outcomes):
+    """造一个客户端，并让它拿到「按剧本回应」的假 SDK。返回 (client, 每次请求的 kwargs)。"""
+    calls: list = []
+    client = DeepSeekVisionClient(Settings(api_key="test-key"))
+    stub = _StubSDK(outcomes, calls)
+    monkeypatch.setattr(client, "client_for", lambda settings: stub)
+    return client, calls
+
+
+MESSAGES = [{"role": "user", "content": "hi"}]
+
+
+def test_retries_once_when_server_rejects_stream_options(monkeypatch):
+    """服务端明确不认 stream_options（400）-> 去掉它再试一次，且第二次不再带该字段。"""
+    client, calls = _sdk_client_with(monkeypatch, [
+        _FakeAPIError("Unrecognized request argument supplied: stream_options", status_code=400),
+        iter([]),
+    ])
+    assert list(client.stream(MESSAGES)) == []
+    assert len(calls) == 2
+    assert "stream_options" in calls[0]
+    assert "stream_options" not in calls[1]
+
+
+def test_no_retry_on_errors_that_cannot_be_about_arguments(monkeypatch):
+    """500 / 401 就算文本里出现 stream_options 也不该重发：那是白等一个来回。"""
+    for status in (500, 401):
+        client, calls = _sdk_client_with(monkeypatch, [
+            _FakeAPIError('{"request": {"stream_options": {}}, "error": "boom"}', status_code=status),
+        ])
+        with pytest.raises(APIError):
+            list(client.stream(MESSAGES))
+        assert len(calls) == 1, f"HTTP {status} 不该触发重试"
+
+
+def test_retry_failure_keeps_the_first_reason(monkeypatch):
+    """两次都失败时，第一次的原因不能被第二次盖掉（只报后者会把人引去查错方向）。"""
+    client, _ = _sdk_client_with(monkeypatch, [
+        _FakeAPIError("Unrecognized request argument supplied: stream_options", status_code=400),
+        _FakeAPIError("invalid api key", status_code=401),
+    ])
+    with pytest.raises(APIError) as excinfo:
+        list(client.stream(MESSAGES))
+    message = str(excinfo.value)
+    assert "invalid api key" in message
+    assert "Unrecognized request argument" in message
+
+
+def test_midway_stream_failure_is_a_library_error(monkeypatch):
+    """流中途断连也必须抛 LocatorError 子类 —— CLI 的 except LocatorError 要兜得住。"""
+
+    def boom():
+        yield _chunk(content="[")
+        raise RuntimeError("connection reset by peer")
+
+    client, _ = _sdk_client_with(monkeypatch, [boom()])
+    with pytest.raises(APIError) as excinfo:
+        list(client.stream(MESSAGES))
+    assert isinstance(excinfo.value, LocatorError)
+    assert isinstance(excinfo.value.__cause__, RuntimeError)
