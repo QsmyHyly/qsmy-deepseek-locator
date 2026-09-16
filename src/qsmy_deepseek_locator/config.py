@@ -111,6 +111,17 @@ def _env_detail() -> str | None:
     return low if low in IMAGE_DETAILS else None
 
 
+def api_key_from_env() -> str | None:
+    """只读环境变量 DEEPSEEK_API_KEY（没设就是 None）。
+
+    单独拎出来，是因为 Key 是唯一「None 表达不了任何语义」的配置项：其余字段的 None 都表示
+    「这个参数不发」，而 Key 没有「不发」这种状态。所以显式传入的 Settings 即使 api_key=None，
+    也只说明「这份配置没带 Key」，不该把「环境变量」这一层一起关掉。
+    回落逻辑在 Locator.__init__，用它的地方都有注释说明为什么。
+    """
+    return _env_str("DEEPSEEK_API_KEY")
+
+
 @dataclass(frozen=True)
 class Settings:
     """一次调用要用到的全部配置快照（不可变）。

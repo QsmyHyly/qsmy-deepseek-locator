@@ -43,7 +43,7 @@ from .client import (
     VisionClient,
     build_messages,
 )
-from .config import Settings
+from .config import Settings, api_key_from_env
 from .debuglog import coerce_log
 from .drawing import resolve_output_path
 from .errors import LocatorError
@@ -245,6 +245,14 @@ class Locator:
                 ⚠️ 值为 None 的键**不覆盖**，所以 thinking=None 表示「沿用」，要关思考请传 False。
         """
         base = settings or Settings.from_env()
+        if base.api_key is None:
+            # 显式传入的 Settings 没带 Key 时，仍按本模块声明的优先级链回落到环境变量：
+            #   函数参数 > Locator 构造参数 > 环境变量 > 内置默认
+            # 不这么做的话，Locator(settings=Settings(model="deepseek-flash")) 这种「只想换个
+            # 模型」的写法会把环境变量里的 Key 一起丢掉，抛出的 MissingAPIKeyError 还会建议你
+            # 「设置 DEEPSEEK_API_KEY」—— 而它其实早就设好了，极具误导性。
+            # 只有 api_key 走这条回落：其余字段的 None 是「不发送该参数」的明确语义（见 Settings）。
+            base = base.merged(api_key=api_key_from_env())
         self.settings = base.merged(**overrides)
         self.client: VisionClient = client or DeepSeekVisionClient(self.settings)
         self.max_side = max_side

@@ -10,7 +10,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "qsmy-deepseek-locator"
-version = "0.1.0"
+version = "0.1.1"
 description = "用 DeepSeek 视觉模型做物体定位：一张图 + 一句话，得到归一化坐标（bbox/point）与中文名称，可直接打标出图。"
 readme = "README.md"
 requires-python = ">=3.9"

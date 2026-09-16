@@ -210,6 +210,35 @@ class TestSettings:
         assert settings.image_detail == "low"
         assert settings.max_tokens == 3000
 
+    def test_explicit_settings_still_falls_back_to_env_key(self, monkeypatch):
+        # 回归：曾经 `settings or Settings.from_env()` 让传进来的 Settings 把环境变量那层
+        # 整层跳过（dataclass 实例恒为真），于是「只想换个模型」会连 Key 一起丢掉。
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-from-env")
+        assert Locator(settings=Settings(model="m")).settings.api_key == "sk-from-env"
+        # 显式给了 Key，就不能被环境变量盖掉
+        assert (
+            Locator(settings=Settings(api_key="sk-explicit")).settings.api_key
+            == "sk-explicit"
+        )
+        # 构造参数优先级最高
+        assert (
+            Locator(settings=Settings(api_key="sk-a"), api_key="sk-b").settings.api_key
+            == "sk-b"
+        )
+        # 函数级参数再高一层
+        assert (
+            Locator(settings=Settings(api_key="sk-a"))
+            .settings.merged(api_key="sk-c")
+            .api_key
+            == "sk-c"
+        )
+
+    def test_explicit_settings_without_key_reports_missing(self, monkeypatch, sample_png):
+        # 没有 Key 时依然要显式报错（环境变量也空，靠 conftest 清干净）
+        monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+        with pytest.raises(MissingAPIKeyError):
+            Locator(settings=Settings(model="m")).locate(sample_png, "猫")
+
     def test_default_timeout_is_generous(self):
         # 这个数字是被实测支撑的（思考模式 + 流式，一次调用可能跑十几秒），别随手调小
         assert DEFAULT_TIMEOUT == 300.0

@@ -79,7 +79,7 @@ from .prompts import DEFAULT_SYSTEM_PROMPT, DEFAULT_USER_PROMPT, build_user_prom
 try:  # 版本号只有一个来源：pyproject.toml
     __version__ = _version("qsmy-deepseek-locator")
 except PackageNotFoundError:  # 未安装（直接从源码 import）时的兜底
-    __version__ = "0.1.0"
+    __version__ = "0.1.1"
 
 __all__ = [
     # 核心
