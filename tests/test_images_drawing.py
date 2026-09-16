@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import base64
+import functools
+import http.server
 import io
+import socketserver
+import threading
 
 import pytest
 from PIL import Image
@@ -45,6 +49,51 @@ class TestLoadImage:
     def test_bad_bytes(self):
         with pytest.raises(ImageLoadError, match="无法解码"):
             load_image(b"this is not an image")
+
+
+@pytest.fixture
+def image_server(tmp_path):
+    """在 127.0.0.1 上起一个只读小服务器，用来离线验证「按 URL 读图」。
+
+    为什么要自建：URL 读图是 `requests` 那条代码路径，不测就等于没验。
+    打外部网站会引入网络波动，本地起一个端口为 0（系统分配）的服务器最稳。
+    """
+    payload = io.BytesIO()
+    Image.new("RGB", (120, 90), (12, 34, 56)).save(payload, format="PNG")
+    (tmp_path / "remote.png").write_bytes(payload.getvalue())
+
+    handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(tmp_path))
+    with socketserver.TCPServer(("127.0.0.1", 0), handler) as server:
+        server.RequestHandlerClass.log_message = lambda *a, **k: None  # 别把访问日志吐进测试输出
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            yield f"http://127.0.0.1:{server.server_address[1]}/remote.png"
+        finally:
+            server.shutdown()
+            thread.join(timeout=5)
+
+
+class TestRemoteUrl:
+    def test_load_from_url(self, image_server):
+        assert load_image(image_server).size == (120, 90)
+
+    def test_to_data_url_from_url(self, image_server):
+        url = to_data_url(image_server)
+        assert url.startswith("data:image/png;base64,")
+        with Image.open(io.BytesIO(base64.b64decode(url.split(",", 1)[1]))) as img:
+            assert img.size == (120, 90)
+
+    def test_source_size_from_url(self, image_server):
+        assert source_size(image_server) == (120, 90)
+
+    def test_404_raises_image_load_error(self, image_server):
+        with pytest.raises(ImageLoadError):
+            load_image(image_server.replace("remote.png", "missing.png"))
+
+    def test_describe_url_is_short(self, image_server):
+        text = describe_source(image_server)
+        assert len(text) < 60 and "127.0.0.1" in text
 
 
 class TestDataUrl:
