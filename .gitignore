@@ -5,13 +5,16 @@ __pycache__/
 build/
 dist/
 .eggs/
-.venv/
+.venv*/
 venv/
 
 # 测试与缓存
 .pytest_cache/
 .coverage
 htmlcov/
+.mypy_cache/
+.ruff_cache/
+.tox/
 
 # 运行产物（评测图片 / 标注图 / 报告）
 runs/

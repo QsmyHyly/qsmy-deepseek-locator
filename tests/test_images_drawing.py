@@ -197,3 +197,20 @@ class TestDraw:
     def test_save_annotated_auto_name(self, sample_png, tmp_path):
         out = save_annotated(sample_png, [], output_dir=tmp_path, stem="固定名")
         assert out.name == "固定名.png"
+
+    def test_save_annotated_follows_suffix(self, sample_png, tmp_path):
+        """扩展名决定格式：写 .jpg 就得是 JPEG 字节，不能挂羊头卖狗肉。
+
+        这条曾经是坏的：save_annotated 写死 format="PNG"，于是 -o out.jpg
+        会产出「文件名 .jpg、内容却是 PNG」的图，下游按后缀读图直接报错。
+        """
+        out = save_annotated(sample_png, [Detection(label="猫", bbox=(0.1, 0.1, 0.5, 0.5))],
+                             path=tmp_path / "out.jpg")
+        assert out.read_bytes()[:2] == b"\xff\xd8"        # JPEG 魔数
+        with Image.open(out) as img:
+            assert img.format == "JPEG"
+
+    def test_save_annotated_rejects_unknown_suffix(self, sample_png, tmp_path):
+        """认不出的后缀要报错，不能偷偷存成 PNG。"""
+        with pytest.raises(ValueError):
+            save_annotated(sample_png, [], path=tmp_path / "out.txt")

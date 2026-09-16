@@ -42,7 +42,7 @@ class FakeClient:
         self.calls: list[dict] = []
 
     def complete(self, messages, *, settings=None, on_event=None, log=None):
-        # log 是 v0.2 起的调试日志参数：本库**只在开启日志时**才传它，
+        # log 是调试日志参数（0.1.0 就有）：本库**只在开启日志时**才传它，
         # 所以假客户端收下它即可，不必真的写文件。
         self.calls.append({"messages": messages, "settings": settings, "log": log})
         if on_event is not None and self.events:
@@ -81,5 +81,6 @@ def _clean_env(monkeypatch):
         "DEEPSEEK_API_KEY", "DEEPSEEK_BASE_URL", "DEEPSEEK_MODEL",
         "QSML_THINKING", "QSML_REASONING_EFFORT", "QSML_IMAGE_DETAIL",
         "QSML_MAX_TOKENS", "QSML_TIMEOUT", "QSML_MAX_RETRIES", "QSML_SYSTEM_PROMPT",
+        "QSML_LOG_FILE",  # 漏了它的话，本机设了该变量自测会真的往那个路径写 JSONL
     ):
         monkeypatch.delenv(name, raising=False)

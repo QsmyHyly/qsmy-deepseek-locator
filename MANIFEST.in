@@ -1,0 +1,12 @@
+# sdist 里要带上「源码之外但被引用」的东西。
+#
+# 为什么必须显式写：setuptools 的默认 sdist 规则只收集 tests/test*.py，
+# tests/conftest.py 不在其中。少了它的后果不只是「测试跑不起来」——
+# conftest 里那条「清空 DEEPSEEK_API_KEY」的 autouse fixture 也会一起消失，
+# 于是本机配了真 Key 的人从 sdist 跑测试会真的打到线上接口（花真钱、还可能被限流）。
+# 实测：未加本文件时，sdist 里 9 个 test_*.py 全在、conftest.py 缺席。
+include LICENSE
+include .env.example
+recursive-include tests *.py
+recursive-include docs *.md
+recursive-include examples *.py

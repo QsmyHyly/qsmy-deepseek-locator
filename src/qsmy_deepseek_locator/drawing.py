@@ -198,10 +198,12 @@ def save_annotated(
     stem: str | None = None,
     **draw_kwargs: Any,
 ) -> Path:
-    """画出标注并保存为 PNG，返回保存路径。
+    """画出标注并保存，返回保存路径；格式由 path 的扩展名决定。
 
     Args:
-        path: 直接给完整文件路径（优先）。
+        path: 直接给完整文件路径（优先）。扩展名决定保存格式
+            （.png/.jpg/.jpeg/.webp/.bmp/.tif/.tiff/.gif），不写扩展名补 .png，
+            认不出的扩展名抛 ValueError —— 理由见 resolve_output_path。
         output_dir / stem: 不给 path 时用它们拼；两者都缺省则落在当前工作目录，
             文件名 annotated_<12位hex>.png。
     """
@@ -211,9 +213,13 @@ def save_annotated(
         directory.mkdir(parents=True, exist_ok=True)
         name = stem or f"annotated_{uuid.uuid4().hex[:12]}"
         path = directory / f"{name}.png"
-    target = Path(path)
+    # 走 resolve_output_path，而不是写死 format="PNG"：本函数是公开 API，
+    # 调用方给 "out.jpg" 就该拿到 JPEG。写死 PNG 会产出「文件名 .jpg、内容却是 PNG」
+    # 的图 —— 正是下面 _OUTPUT_FORMATS 注释里点名的那类最难排查的问题。
+    # CLI 的 -o 与 Locator.locate_and_draw 都走这里，所以这一处同时修好三条路径。
+    target, fmt = resolve_output_path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    annotated.save(target, format="PNG")
+    annotated.save(target, format=fmt)
     return target
 
 

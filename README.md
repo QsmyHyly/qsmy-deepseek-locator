@@ -33,9 +33,14 @@ qsmy-deepseek-locator photo.png -t "红色圆形" -o annotated.png
 
 ## 1. 安装
 
-本地开发（当前阶段就用这个，尚未发布 PyPI）：
+```bash
+pip install qsmy-deepseek-locator
+```
+
+要改源码、跑测试就用可编辑安装：
 
 ```bash
+git clone https://github.com/QsmyHyly/qsmy-deepseek-locator.git
 cd qsmy-deepseek-locator
 python -m venv .venv && .venv\Scripts\activate      # Windows；macOS/Linux 用 source .venv/bin/activate
 pip install -e ".[dev]"
@@ -43,7 +48,7 @@ pip install -e ".[dev]"
 
 依赖只有三个：`openai`（DeepSeek 走 OpenAI 兼容协议）、`Pillow`（读图 / 打标）、`requests`（下载图片 URL）。
 
-跑自测（175 个用例，**全程离线、不花 API**）：
+跑自测（179 个用例，**全程离线、不花 API**）：
 
 ```bash
 python -m pytest tests -q
@@ -59,7 +64,7 @@ export DEEPSEEK_API_KEY="sk-你的key"
 ```
 
 也可以不设环境变量，直接传参：`Locator(api_key="sk-...")` 或 `locate(..., api_key="sk-...")`。
-其余可配项见 [`.env.example`](./.env.example)。
+其余可配项见 [`.env.example`](https://github.com/QsmyHyly/qsmy-deepseek-locator/blob/main/.env.example)。
 
 > **没有 Key 会怎样**：直接抛 `MissingAPIKeyError`，并告诉你三种配法。
 > 本库刻意**不提供**「无 Key 时返回假数据」的降级 —— 演示程序这样做很方便，
@@ -220,7 +225,12 @@ locator = Locator(
     timeout=300,            # 单次请求超时（秒）；恒走流式，超时按「两次数据之间的静默」算
     max_side=None,         # 发送前把图缩到最长边不超过它（省流量，不影响坐标精度）
 )
+```
 
+上面这些名字都会被 `Settings.merged()` 收下（真实签名是 `Locator(*, settings=None, client=None, max_side=None, **overrides)`），
+所以除了它们，还可以直接传 `client=`（自备客户端）、`settings=`（整份配置）、`max_retries=`、`log_file=`（调试日志）。
+
+```python
 result = locator.locate(
     "photo.png",           # 路径 / URL / bytes / PIL.Image / data URL
     "红色圆形",             # 找什么（省略 = 识别主要物体）
@@ -370,7 +380,7 @@ A：不能。每张图服务端最多只算 384 token，大图无论如何都会
 
 **Q：为什么极扁 / 极长的图上定位很差？**
 A：那是模型能力的边界，不是库的缺陷：长边被缩到约 1000 后，密集小目标只剩几像素。
-详见 [`docs/API-NOTES.md`](./docs/API-NOTES.md) 第 9 节。
+详见 [`docs/API-NOTES.md`](https://github.com/QsmyHyly/qsmy-deepseek-locator/blob/main/docs/API-NOTES.md) 第 9 节。
 
 **Q：想实时看到模型的思考、正文、工具调用，有现成的代码吗？**
 A：有，见第 7 节。一句话版：给 `locate` / `locate_to_file` 传 `on_event=你的回调`，
@@ -389,7 +399,7 @@ A：**不会**。`tools` 原样透传、调用请求拼好放在 `ChatReply.tool
 
 ## 9. 文档
 
-- [`docs/API-NOTES.md`](./docs/API-NOTES.md) —— DeepSeek 接口事实与踩坑记录（**这个库为什么长这样**）。
+- [`docs/API-NOTES.md`](https://github.com/QsmyHyly/qsmy-deepseek-locator/blob/main/docs/API-NOTES.md) —— DeepSeek 接口事实与踩坑记录（**这个库为什么长这样**）。
   代码里凡是为某条坑做了特殊处理的地方，都用 `@doc docs/API-NOTES.md#<锚点>` 指回对应小节。
 - 其余说明按「文档就近写在代码里」的原则放在模块头注释：
   `prompts.py`（提示词为什么这么写）、`parsing.py`（刻度兜底与为何不猜）、
@@ -409,5 +419,5 @@ A：**不会**。`tools` 原样透传、调用请求拼好放在 `ChatReply.tool
 
 ## 11. 许可证
 
-[MIT](./LICENSE)。`docs/` 中的接口事实整理自 DeepSeek 官方文档与实际调用观测，
+[MIT](https://github.com/QsmyHyly/qsmy-deepseek-locator/blob/main/LICENSE)。`docs/` 中的接口事实整理自 DeepSeek 官方文档与实际调用观测，
 以官方站点 <https://api-docs.deepseek.com> 为准。

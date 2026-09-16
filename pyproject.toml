@@ -1,7 +1,11 @@
 [build-system]
-# setuptools 而不是 hatchling：本机 setuptools 65.5 已就位，editable 安装（PEP 660）开箱可用，
-# 不额外引入构建后端依赖。本机 pip 22.3.1 也满足 editable 的最低要求。
-requires = ["setuptools>=64", "wheel"]
+# setuptools 而不是 hatchling：不额外引入构建后端依赖。
+# 下限抬到 77 是为了 PEP 639 的 SPDX 许可证写法（license = "MIT" + license-files）：
+# 旧写法 license = { text = "..." } 在 setuptools 84 上已报弃用（截止 2027-02-18），
+# 而 PEP 639 明确允许 PyPI 拒绝带弃用许可证标识的上传，不值得押在上面。
+# 本机开发环境的 setuptools 65.5 低于这个下限也没关系：python -m build 与 pip install
+# 默认都开构建隔离，会自动下载满足下限的 setuptools。
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -10,13 +14,13 @@ version = "0.1.0"
 description = "用 DeepSeek 视觉模型做物体定位：一张图 + 一句话，得到归一化坐标（bbox/point）与中文名称，可直接打标出图。"
 readme = "README.md"
 requires-python = ">=3.9"
-license = { text = "MIT" }
+license = "MIT"              # PEP 639 SPDX 表达式；写了它就不能再放 License :: 分类器
+license-files = ["LICENSE"]
 authors = [{ name = "qsmy" }]
 keywords = ["deepseek", "vision", "vlm", "object-localization", "grounding", "multimodal", "annotation"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Intended Audience :: Developers",
-  "License :: OSI Approved :: MIT License",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.9",
   "Programming Language :: Python :: 3.10",
@@ -32,17 +36,22 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.0"]
+dev = ["pytest>=7.0", "build>=1.0", "twine>=6.0"]  # 后两个是发版用：python -m build / twine check
 
 [project.urls]
 Homepage = "https://github.com/QsmyHyly/qsmy-deepseek-locator"
+Repository = "https://github.com/QsmyHyly/qsmy-deepseek-locator"
+Issues = "https://github.com/QsmyHyly/qsmy-deepseek-locator/issues"
 
 [project.scripts]
 # 一个入口两个用法：qsmy-deepseek-locator <图片> ...  /  qsmy-deepseek-locator bench ...
 qsmy-deepseek-locator = "qsmy_deepseek_locator.cli:main"
 
 [tool.setuptools.packages.find]
+# include 白名单：不写的话，以后 src/ 下多出任何目录都会被当成包打进 wheel
+# （默认 namespaces = true，没有 __init__.py 的目录也算命名空间包）。
 where = ["src"]
+include = ["qsmy_deepseek_locator*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

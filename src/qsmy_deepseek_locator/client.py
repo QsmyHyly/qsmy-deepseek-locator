@@ -90,7 +90,7 @@ class VisionClient(Protocol):
     ) -> ChatReply:
         ...
 
-    # 注：log **只在开启日志时**才会被传进来（见 locate.py 里的 _call_kwargs）。
+    # 注：log **只在开启日志时**才会被传进来（见 locate.py 里那个 log_kwarg）。
     # 这样自备客户端、自己实现了本协议的老代码，不用日志功能时完全不受影响。
 
 

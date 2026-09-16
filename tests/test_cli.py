@@ -53,6 +53,45 @@ class TestLocateCommand:
         assert code == 1
         assert "不存在" in capsys.readouterr().err
 
+    def test_bad_output_suffix_fails_before_calling_the_model(self, sample_png, capsys, monkeypatch):
+        """-o 的后缀写错要在**调模型之前**就报错：不该白花一次 API 调用才发现。"""
+        from qsmy_deepseek_locator import LocateResult
+
+        called = {"n": 0}
+
+        class StubLocator:
+            def __init__(self, **kwargs):
+                pass
+
+            def locate(self, *args, **kwargs):
+                called["n"] += 1
+                return LocateResult()
+
+        monkeypatch.setattr("qsmy_deepseek_locator.cli.Locator", StubLocator)
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+        assert main([str(sample_png), "-t", "猫", "-o", "out.txt", "-q"]) == 1
+        assert called["n"] == 0
+        assert "不支持" in capsys.readouterr().err
+
+    def test_out_suffix_is_honoured(self, sample_png, tmp_path, monkeypatch):
+        """-o 写 .jpg 就得真的写出 JPEG（CLI 与 save_annotated 共用一条路径）。"""
+        from qsmy_deepseek_locator import Detection, LocateResult
+
+        class StubLocator:
+            def __init__(self, **kwargs):
+                pass
+
+            def locate(self, *args, **kwargs):
+                return LocateResult(
+                    detections=[Detection(label="猫", bbox=(0.1, 0.1, 0.5, 0.5))]
+                )
+
+        monkeypatch.setattr("qsmy_deepseek_locator.cli.Locator", StubLocator)
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+        out = tmp_path / "cat.jpg"
+        assert main([str(sample_png), "-t", "猫", "-o", str(out), "-q"]) == 0
+        assert out.read_bytes()[:2] == b"\xff\xd8"
+
 class TestDebugLogFlags:
     """--log / --log-file 只做一件事：把路径塞进 locate()。真写文件由库负责（见 test_debuglog.py）。"""
 

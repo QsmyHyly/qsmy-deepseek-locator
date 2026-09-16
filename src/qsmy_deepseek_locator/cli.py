@@ -145,6 +145,19 @@ def locate_main(argv: Sequence[str]) -> int:
         # 先说日志写到哪，再干活：这次的输出就是给人「照着文件去翻」用的
         sys.stderr.write(f"调试日志：{log_file}\n")
 
+    out: Path | None = None
+    if not args.no_draw:
+        from .drawing import resolve_output_path
+
+        # 输出路径**先校验、后调模型**：`-o out.tiff` 这种写错的后缀不该等花掉一次
+        # API 调用才发现。locate_to_file 也是这个顺序，两条入口保持一致。
+        out = Path(args.out) if args.out else _default_out(args.image)
+        try:
+            out, _fmt = resolve_output_path(out)
+        except ValueError as exc:
+            sys.stderr.write(f"\n错误：{exc}\n")
+            return 1
+
     try:
         result = locator.locate(
             args.image,
@@ -173,11 +186,11 @@ def locate_main(argv: Sequence[str]) -> int:
     if not args.no_draw:
         from .drawing import save_annotated
 
-        out = Path(args.out) if args.out else _default_out(args.image)
         try:
             path = save_annotated(args.image, result.detections, path=out)
             sys.stderr.write(f"标注图：{path}\n")
-        except LocatorError as exc:
+        except (LocatorError, ValueError) as exc:
+            # ValueError 来自扩展名校验（正常已在上面的预校验里拦下，这里是双保险）
             sys.stderr.write(f"标注图保存失败：{exc}\n")
             return 1
     return 0
