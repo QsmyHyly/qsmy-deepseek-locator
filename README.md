@@ -257,6 +257,15 @@ save_annotated(image, result, path="out.png")     # -> Path
 A：九成是思考 token 吃光了输出上限（此时 HTTP 仍是 200，`content` 就成了空串）。
 调大 `max_tokens`、或关掉思考（`thinking=False`）、或降 `reasoning_effort`。异常信息里就写着这三条。
 
+**Q：调用会不会超时？需要自己开流式吗？**
+A：不用管，**本库内部恒走流式**（报文里固定带 `stream: true` 与 `stream_options.include_usage`），
+`locate` / `locate_to_file` / CLI 全是同一条路径，只是收完流之后一次性把结果交给你。
+流式对超时的意义是实测过的：同一张图、同一份报文、`timeout=2` 秒时，
+**流式跑了 7.42 秒正常返回**（2880 个 chunk，相邻 chunk 最大间隔 507ms），
+**非流式 2.14 秒就被 `APITimeoutError` 打断** —— 换句话说，关掉流式会让本来能成的请求直接失败。
+代价是它的超时口径是「两次数据之间的静默」而不是总时长：模型迟迟不吐第一个字时照样会被打断，
+所以 `timeout` 不要设得太贴（默认 120s 就是个宽松值）。
+
 **Q：模型一个目标都没找到，是报错吗？**
 A：不是。`result.empty` 为真、`warnings` 里会说清是「模型明确回了空数组」还是「正文里没有坐标」。
 后者通常意味着提示词没被遵守，该改提示词而不是重试。
