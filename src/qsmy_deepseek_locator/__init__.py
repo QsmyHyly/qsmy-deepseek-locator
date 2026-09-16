@@ -34,6 +34,7 @@ from .client import (
 from .config import (
     DEFAULT_BASE_URL,
     DEFAULT_MODEL,
+    DEFAULT_TIMEOUT,
     IMAGE_DETAILS,
     REASONING_EFFORTS,
     Settings,
@@ -95,6 +96,7 @@ __all__ = [
     "build_request",
     "DEFAULT_BASE_URL",
     "DEFAULT_MODEL",
+    "DEFAULT_TIMEOUT",
     "REASONING_EFFORTS",
     "IMAGE_DETAILS",
     # 图片

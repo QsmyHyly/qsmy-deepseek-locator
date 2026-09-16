@@ -28,6 +28,14 @@ from .prompts import DEFAULT_SYSTEM_PROMPT
 DEFAULT_BASE_URL = "https://api.deepseek.com"
 DEFAULT_MODEL = "deepseek-flash"
 
+# 单次请求超时（秒）。**故意给得宽松**，因为：
+#   1. 本库恒走流式，超时口径是「两次数据之间的静默」而不是整轮总时长 ——
+#      思考模式下首字节可能好几秒才来，生成慢是常态（实测 6 目标的图思考开时花了 7.4s）；
+#   2. 这里同时也是连接/写入超时，网络差的时候 120s 会误杀本来能成的请求。
+# 代价要说清：服务端真挂住时，一次调用最多等 timeout × (max_retries + 1) —— 300s × 3 是上限。
+# 想更激进/更保守都行：Settings(timeout=...)、Locator(timeout=...)、或环境变量 QSML_TIMEOUT。
+DEFAULT_TIMEOUT = 300.0
+
 # reasoning_effort 的合法取值。不在此集合内一律不传，避免服务端 400；
 # 空值表示「不传该参数」，由服务端按自己的默认档处理（当前是 high）。
 REASONING_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
@@ -114,7 +122,7 @@ class Settings:
     api_key: str | None = None
     base_url: str = DEFAULT_BASE_URL
     model: str = DEFAULT_MODEL
-    timeout: float = 120.0
+    timeout: float = DEFAULT_TIMEOUT
     max_retries: int = 2
     # 思考模式开关：None = 不传（服务端默认开启），True/False = 显式开关。
     thinking: bool | None = None
@@ -132,7 +140,7 @@ class Settings:
             api_key=_env_str("DEEPSEEK_API_KEY"),
             base_url=_env_str("DEEPSEEK_BASE_URL") or DEFAULT_BASE_URL,
             model=_env_str("DEEPSEEK_MODEL") or DEFAULT_MODEL,
-            timeout=_env_float("QSML_TIMEOUT") or 120.0,
+            timeout=_env_float("QSML_TIMEOUT") or DEFAULT_TIMEOUT,
             max_retries=2 if retries is None else retries,
             thinking=_env_bool("QSML_THINKING"),
             reasoning_effort=_env_effort(),
@@ -182,6 +190,7 @@ __all__ = [
     "Settings",
     "DEFAULT_BASE_URL",
     "DEFAULT_MODEL",
+    "DEFAULT_TIMEOUT",
     "REASONING_EFFORTS",
     "IMAGE_DETAILS",
     "redacted",

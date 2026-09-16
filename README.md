@@ -216,7 +216,7 @@ locator = Locator(
     reasoning_effort=None, # low/medium/high/xhigh/max
     image_detail=None,     # low/high/original/auto；默认不发送该字段
     max_tokens=None,       # 输出上限（含思考 token）
-    timeout=120,
+    timeout=300,            # 单次请求超时（秒）；恒走流式，超时按「两次数据之间的静默」算
     max_side=None,         # 发送前把图缩到最长边不超过它（省流量，不影响坐标精度）
 )
 
@@ -264,7 +264,9 @@ A：不用管，**本库内部恒走流式**（报文里固定带 `stream: true`
 **流式跑了 7.42 秒正常返回**（2880 个 chunk，相邻 chunk 最大间隔 507ms），
 **非流式 2.14 秒就被 `APITimeoutError` 打断** —— 换句话说，关掉流式会让本来能成的请求直接失败。
 代价是它的超时口径是「两次数据之间的静默」而不是总时长：模型迟迟不吐第一个字时照样会被打断，
-所以 `timeout` 不要设得太贴（默认 120s 就是个宽松值）。
+所以 `timeout` 不要设得太贴 —— 默认就是 **300s**（连接/写入超时也用它）。
+真挂住时的最坏等待是 `timeout × (max_retries + 1)`，默认即 300s × 3，
+想收紧就传 `timeout=60` 或设 `QSML_TIMEOUT`。
 
 **Q：模型一个目标都没找到，是报错吗？**
 A：不是。`result.empty` 为真、`warnings` 里会说清是「模型明确回了空数组」还是「正文里没有坐标」。

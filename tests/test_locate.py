@@ -14,7 +14,7 @@ from qsmy_deepseek_locator.client import (
     resolve_thinking,
     thinking_payload,
 )
-from qsmy_deepseek_locator.config import Settings
+from qsmy_deepseek_locator.config import DEFAULT_TIMEOUT, Settings
 from qsmy_deepseek_locator.errors import EmptyResponseError, MissingAPIKeyError
 from qsmy_deepseek_locator.locate import Locator, locate
 from qsmy_deepseek_locator.prompts import DEFAULT_SYSTEM_PROMPT
@@ -209,6 +209,16 @@ class TestSettings:
         assert settings.reasoning_effort == "max"
         assert settings.image_detail == "low"
         assert settings.max_tokens == 3000
+
+    def test_default_timeout_is_generous(self):
+        # 这个数字是被实测支撑的（思考模式 + 流式，一次调用可能跑十几秒），别随手调小
+        assert DEFAULT_TIMEOUT == 300.0
+        assert Settings().timeout == 300.0
+        assert Settings.from_env().timeout == 300.0
+
+    def test_timeout_env_overrides_default(self, monkeypatch):
+        monkeypatch.setenv("QSML_TIMEOUT", "45")
+        assert Settings.from_env().timeout == 45.0
 
     def test_bad_env_values_ignored(self, monkeypatch):
         monkeypatch.setenv("QSML_THINKING", "可能吧")
