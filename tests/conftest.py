@@ -42,10 +42,14 @@ class FakeClient:
         self.events = events
         self.calls: list[dict] = []
 
-    def complete(self, messages, *, settings=None, on_event=None, log=None):
+    def complete(self, messages, *, settings=None, on_event=None, timeout=None, log=None):
         # log 是调试日志参数（0.1.0 就有）：本库**只在开启日志时**才传它，
         # 所以假客户端收下它即可，不必真的写文件。
-        self.calls.append({"messages": messages, "settings": settings, "log": log})
+        # timeout 也记下来：它是"生效后的读超时有没有真的传到自备客户端"的唯一证据，
+        # 少记这一项的话，那条参数在协议里加了也等于没加（没人能断言它到没到）。
+        self.calls.append(
+            {"messages": messages, "settings": settings, "timeout": timeout, "log": log}
+        )
         if on_event is not None and self.events:
             if self.reasoning:
                 on_event({"type": "reasoning", "text": self.reasoning[:4]})

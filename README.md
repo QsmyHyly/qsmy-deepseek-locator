@@ -48,7 +48,7 @@ pip install -e ".[dev]"
 
 **必装依赖只有两个**：`Pillow`（读图 / 打标）与 `requests`（下载图片 URL + 裸 HTTP 客户端）。
 
-`openai` 自 **0.1.3 起是可选依赖**：它依赖的 `jiter` / `pydantic-core` 都是 **Rust 扩展**，
+`openai` 在**本次改动后是可选依赖**（下面的说明与仓内「0.1.3」字样同指尚未发版的那批改动）：它依赖的 `jiter` / `pydantic-core` 都是 **Rust 扩展**，
 没有 Android/aarch64 的 wheel（`pip install --dry-run openai` 会报
 `Target triple not supported by rustup`），在手机上「照文档装一遍」是装不上的。
 不装它也能完整使用本库 —— 换成自带的自备客户端即可，它只用 `requests`：
@@ -65,7 +65,12 @@ locator = Locator(client=RequestsVisionClient(api_key="sk-xxx"), thinking=False)
 result = locator.locate("photo.png", "红色圆形")
 ```
 
-两个客户端的差别（重试、超时口径、日志详略）写在 `http_client.py` 的模块头里。
+两个客户端的差别写在 `http_client.py` 的模块头里（**有一节"与 DeepSeekVisionClient 的已知差别"
+的诚实清单**，选型前值得看一眼）。一句话概括：
+
+- `Locator(timeout=…)` / `QSML_TIMEOUT` 对**两个客户端都生效**（本次改动修：以前只对 SDK 版生效）；
+- SDK 版会按 `max_retries` 自动重试、且会对"服务端不认 `stream_options`"退一步重发；裸 HTTP 版**都不会**；
+- `log_file=…` 的 `chunks=True`（记原始 SSE 帧）只有 SDK 版有。
 
 跑自测（**全程离线、不花 API**）：
 
@@ -264,7 +269,6 @@ result = locator.locate(
 > ⚠️ **所有入口都是同步阻塞调用。** 最坏等待是 `timeout × (max_retries + 1)`，
 > 默认就是 **300s × 3 = 900s**。别在主线程 / UI 线程里直接调 —— 安卓上会 ANR，
 > 桌面 GUI 会卡住窗口。移动端与 GUI 请丢进后台线程，并用 `cancel_event` 接一个「取消」按钮。
-```
 
 `LocateResult` 上有什么：
 
@@ -290,7 +294,11 @@ draw(image, result, font_path="/system/fonts/NotoSansCJK-Regular.ttc")   # 指�
 save_annotated(image, result, path="out.png")     # -> Path
 ```
 
-### 6.1 异常一览（0.1.3 起闭合：抛出的东西**总是** `LocatorError`）
+### 6.1 异常一览（本次改动后闭合：识别与出图 API 抛出的东西**总是** `LocatorError`）
+
+「闭合」指的是**正常用库**会碰到的那些路径：定位、打标、落盘、读图、调接口、取消。
+本地评测工具（`benchmark` / `bench`）写中间产物时仍是原生 `OSError` —— 它跑在开发者
+自己的机器上、失败就该看到完整栈，套一层包装反而更难查。
 
 | 异常 | 什么时候抛 | 额外继承 |
 |---|---|---|
@@ -302,10 +310,15 @@ save_annotated(image, result, path="out.png")     # -> Path
 | `UnsupportedFeatureError` | `use_tools=True`（v0.1 没有 Agent 循环） | `NotImplementedError` |
 | `OutputPathError` | 输出路径空 / 后缀不认识 | `ValueError` |
 | `LogFileTypeError` | `log_file` 的类型不认识 | `ValueError` |
-| `WriteError` | 输出目录建不出来、标注图最终写不进去（原始 `OSError` 在 `__cause__`） | — |
+| `WriteError` | 输出目录建不出来、标注图/结果 JSON 最终写不进去（原始 `OSError` 在 `__cause__`） | 无（**唯一一个没留退路的**，见下） |
 | `CancelledError` | 你传的 `cancel_event` 被 `set()` 了 | — |
 
-「额外继承」那一列是**向后兼容**：0.1.2 及以前这些路径抛的就是裸的 `NotImplementedError` /
+⚠️ **升级时唯一要检查的一处**：以前「磁盘满 / 目录只读 / 父目录是个文件」这类失败抛的是
+原生 `OSError`，现在抛 `WriteError`（它不继承 `OSError`）。如果你写过 `except OSError`
+来接这些路径，请改成 `except WriteError` —— 否则会**静默漏接**（异常照旧往上冒，但你的兜底没生效）。
+之所以不给它再叠一个 `OSError` 父类，理由见 `errors.py` 模块头最后一段。
+
+「额外继承」那一列是**向后兼容**：以前这些路径抛的就是裸的 `NotImplementedError` /
 `ValueError`，保留继承关系，旧的 `except` 子句才不会被静默漏接。取舍写在 `errors.py` 模块头。
 
 ## 7. 看过程：流式事件
@@ -409,7 +422,7 @@ A：不用管，**本库内部恒走流式**（报文里固定带 `stream: true`
 
 **Q：中文标签变成方块（豆腐块）了怎么办？**
 A：说明没找到含中文字形的字体，库已经退回 PIL 内置位图字体 —— **并且会发一条 UserWarning 提醒你**
-（0.1.3 之前这一步是静默的，图能正常出、只有标签是豆腐块，很难发现）。三种给法任选一种：
+（以前这一步是静默的，图能正常出、只有标签是豆腐块，很难发现）。三种给法任选一种：
 
 ```python
 resolve_font(22, font_path="/system/fonts/NotoSansCJK-Regular.ttc")   # 1) 当场指定
@@ -424,6 +437,12 @@ export QSML_FONT_DIR=/system/fonts                           # 3) 只指定探�
 探测顺序是**字体名优先**（外循环名字、内循环目录），而且选中后会**真渲染一遍确认它有中文字形**
 —— 只看文件名会踩坑：安卓上 `/system/fonts/DroidSans.ttf` 是 Roboto 的软链，
 名字像中文字体、实际只有拉丁字形。
+
+**Q：升级后 `-o out.jpg` 画出来的东西和以前不一样了？**
+A：是修好了一个老问题。以前**无论后缀一律存 PNG**，`out.jpg` 里其实是 PNG 字节（改名不改内容），
+于是「按后缀读出来的格式」和「文件真实格式」对不上。现在后缀说了算：`.jpg` 就是真 JPEG。
+如果下游代码正靠 `out.jpg` 当 PNG 用（比如直接喂给只认 PNG 字节的东西），升级后请改回 `.png` 后缀。
+三条出图路径（`locate_to_file` / `save_annotated` / `Locator.locate_and_draw`）现在同一套规则。
 
 **Q：调用会不会卡住主线程？能中途取消吗？**
 A：**会卡，而且可能卡几分钟** —— 全部入口都是同步阻塞的，最坏 `timeout × (max_retries + 1)`；
@@ -460,7 +479,7 @@ A：有，见第 7 节。一句话版：给 `locate` / `locate_to_file` 传 `on_
 **Q：异常该怎么兜？网络中途断了抛什么？**
 A：全都继承 `LocatorError`，`except LocatorError` 一把兜住即可，具体的子类见第 6 节。
 
-**0.1.3 起这个承诺是闭合的**：以前还会漏出三类裸异常 —— `NotImplementedError`（`use_tools=True`）、
+**本次改动后这个承诺才是闭合的**：以前还会漏出三类裸异常 —— `NotImplementedError`（`use_tools=True`）、
 `ValueError`（输出路径后缀不认识 / `log_file` 类型不认识）、`OSError`（标注图最终落盘那行）。
 现在它们分别变成 `UnsupportedFeatureError` / `OutputPathError` / `LogFileTypeError` / `WriteError`，
 且**全部多重继承**（`LocatorError` + 原来那个基类），所以旧的 `except ValueError` /

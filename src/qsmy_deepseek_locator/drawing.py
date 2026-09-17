@@ -26,6 +26,7 @@ QSML_FONT_PATH / QSML_FONT_DIR。
 from __future__ import annotations
 
 import os
+import sys
 import uuid
 import warnings
 from functools import lru_cache
@@ -143,17 +144,45 @@ def _load_truetype(path: str | None, size: int, *, verify: bool) -> Any | None:
     return font
 
 
-def _warn_no_cjk() -> None:
+def _own_frames_above() -> int:
+    """从**本函数**往上数：连续多少帧是本模块自己的代码（用于把告警指到用户那一行）。
+
+    比的是**绝对路径**：f_code.co_filename 与模块的 __file__ 都可能是相对/绝对形式
+    （取决于怎么被 import 的），直接 == 会在某些启动方式下永远为假 —— 那会让
+    「往上找用户代码」原地不动，告警位置指回库内部，等于白算。
+
+    为什么在发出告警的地方现算，而不是让每个调用点写魔数：resolve_font 有三条
+    到告警的路径（自己直发、「显式路径打不开」和「自动探测」各穿一次 _find_font_file，
+    再加上 draw() 还可能在外面）。手写 stacklevel 必然有一边指错 —— 指错到
+    drawing.py 内部时，用户看到的是「drawing.py:298」，等于没告诉他改哪儿。
+    """
+    frames = 0
+    walker = sys._getframe(1)
+    while walker is not None and os.path.abspath(walker.f_code.co_filename) == os.path.abspath(__file__):
+        walker = walker.f_back
+        frames += 1
+    return frames
+
+
+def _warn_no_cjk(*, own_frames: int) -> None:
     """找不到含中文字形的字体时告警一次（同一进程只吵一次）。
 
     为什么必须说出来：降级到 load_default() 时**图还是能正常出**，只是中文标签变成方块。
     这种「悄悄坏掉」在安卓上代价极大 —— 用户看到的是「定位成功、标签乱码」，
     第一反应是模型不行或我们解析错了，而真实原因只是少了一个目录。宁可吵，不可静默。
+
+    own_frames = 从「本函数的调用者」往上数、连续属于本模块的帧数（调用点用
+    _own_frames_above() 现算）。stacklevel = own_frames + 2：+1 补上本函数自己这一帧，
+    再 +1 落到最顶上那一帧的用户代码 —— 于是无论从哪条路进来，告警都指在用户写的那一行。
+
+    （试过 warnings.warn_explicit 的 filename/lineno，实测没能改掉位置，报出来的仍是
+    本文件行号；所以这里回到 stacklevel，只是把数字算准。）
     """
     global _warned_no_cjk
     if _warned_no_cjk:
         return
     _warned_no_cjk = True
+    stacklevel = own_frames + 2
     warnings.warn(
         "没有找到含中文字形的字体文件，已退回 PIL 内置位图字体："
         "英文标签可以正常显示，**中文标签会变成方块（豆腐块）**。\n"
@@ -163,7 +192,7 @@ def _warn_no_cjk() -> None:
         "  3) 环境变量 QSML_FONT_DIR=/path/to/字体目录（库会在里面按候选名找）。\n"
         f"本机探测过的目录：{[str(p) for p in _FONT_DIRS]}",
         UserWarning,
-        stacklevel=4,   # 指到调用 resolve_font 的那一行（draw -> resolve_font -> 这里）
+        stacklevel=stacklevel,
     )
 
 
@@ -223,7 +252,8 @@ def resolve_font(size: int = 20, *, font_path: str | Path | None = None) -> Any:
     传对象进来的话「同一个字体换个字号」就得重新开文件，而打标路径上字号是常量、
     字体文件却可能很大（NotoSansCJK 是 32MB，安卓上每次重开都是实打实的 IO）。
     """
-    key = (str(font_path) if font_path else "", size)
+    asked = "explicit" if font_path else "auto"
+    key = (str(font_path) if font_path else "", size, asked)
     if key in _font_cache:
         return _font_cache[key]
 
@@ -231,6 +261,16 @@ def resolve_font(size: int = 20, *, font_path: str | Path | None = None) -> Any:
         font = _load_truetype(str(font_path), size, verify=False)
         if font is not None:
             return _remember(key, font)
+        # 显式路径打不开 -> 继续走探测。这条兜底**必须**保留：调用方传 font_path 的
+        # 典型场景就是「配置里写死一个路径、换台机器就没了」，此时能自己找到就别让他去修配置。
+        # 但缓存键留在 "explicit"，这样「坏路径 → 退回探测」这个结果本身也会被记住。
+        path = _find_font_file()
+        if path:
+            font = _load_truetype(path, size, verify=False)
+            if font is not None:
+                return _remember(key, font)
+        _warn_no_cjk(own_frames=_own_frames_above())
+        return _remember(key, ImageFont.load_default())
 
     path = _find_font_file()
     if path:
@@ -240,7 +280,7 @@ def resolve_font(size: int = 20, *, font_path: str | Path | None = None) -> Any:
         if font is not None:
             return _remember(key, font)
 
-    _warn_no_cjk()
+    _warn_no_cjk(own_frames=_own_frames_above())
     return _remember(key, ImageFont.load_default())
 
 
@@ -542,9 +582,11 @@ def save_annotated(
             文件名 annotated_<12位hex>.png。
 
     Raises:
-        OutputPathError: 路径本身不可用（空、后缀不认识、父目录是个文件……）。
-        WriteError: 路径没问题但写不动（磁盘满、只读挂载、没有写权限），
-            原始 OSError 在 __cause__ 上。两者都是 LocatorError，一把兜得住。
+        OutputPathError: **路径这个字符串**不可用：空路径，或者扩展名认不出
+            （只认 .png / .jpg / .jpeg / .webp / .bmp，见模块里的 _FORMATS）。
+        WriteError: 路径没问题但落不下去 —— 父目录建不出来（含"父目录位置被一个文件占着"）、
+            磁盘满、只读挂载、没有写权限。原始 OSError 在 __cause__ 上。
+            两者都是 LocatorError，一把兜得住；分开是因为修法不同（改参数 vs 改环境）。
     """
     annotated = draw(image, items, **draw_kwargs)
     if path is None:
@@ -563,7 +605,7 @@ def save_annotated(
     except (OSError, ValueError) as exc:
         # 落盘是**最后一步**，崩在这里意味着前面那次 API 调用已经花掉了。
         # 所以这里必须把话说全：哪个路径、什么原因、先前有没有成功。
-        # 0.1.2 及以前这一行是裸的 annotated.save()，抛出去的是原生 OSError /
+        # 本次改动前这一行是裸的 annotated.save()，抛出去的是原生 OSError /
         # ValueError（PIL 认不出格式时），只写 except LocatorError 的调用方直接漏网。
         raise WriteError(
             f"标注图写入失败：{target}（{type(exc).__name__}: {exc}）\n"

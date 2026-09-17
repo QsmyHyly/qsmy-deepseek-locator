@@ -27,6 +27,11 @@
     两者都在下面 import 回来，所以
     「from qsmy_deepseek_locator.benchmark import make_sample, evaluate_sample」照旧可用 ——
     benchmark.py 仍是对外那一个门面，README 第 5 节承诺的两个编程接口还在原处。
+
+异常口径：本模块**刻意不把写文件的 OSError 包成 WriteError**。它是跑在开发者自己机器上的
+本地工具（产物落在 runs/），失败时想看的是完整的系统错误（哪个盘、哪个 inode、什么 errno）；
+套一层"识别已经完成，不必再调一次模型"的文案只会把信息挡掉。所以 README 第 6.1 节那句
+「抛出的东西总是 LocatorError」限定在**识别与出图 API**，不含评测工具的中间产物。
 """
 
 from __future__ import annotations

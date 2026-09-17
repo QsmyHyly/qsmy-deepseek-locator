@@ -8,7 +8,7 @@
 无 Key 时会进 Mock 模式，那对演示页很友好，但对一个库是危险的：
 用户会拿到一堆看起来正常的坐标，却以为真的调用了模型。本库缺 Key 就报错。
 
-**契约闭合（0.1.3）**：0.1.2 及以前，除了下面这些 LocatorError 之外还会漏出三类裸异常 ——
+**契约闭合（本次改动）**：在此之前，除了下面这些 LocatorError 之外还会漏出三类裸异常 ——
 `NotImplementedError`（use_tools=True）、`ValueError`（输出路径后缀 / log_file 类型）、
 `OSError`（标注图最终落盘那行没有 try/except）。只写 `except LocatorError` 的调用方
 会在最后一步落盘上崩掉，而异常类型也不在文档承诺里 —— 安卓 App 那边正是因此只能抓
@@ -31,6 +31,11 @@
 路径长度……原因全在调用方那边，本库只能转述），并进来没给调用方任何新信息；
 二来 OSError 的 `__init__` 有自己的一套 args 语义（errno / strerror），混着用会让异常对象的
 `args` 说不清，而排查时看的恰恰是它。原始 OSError **一个都不会丢** —— 一律挂在 `__cause__` 上。
+
+这条硬承诺的**适用范围要写清楚**：它覆盖识别与出图 API（定位、打标、落盘、读图、调接口、
+取消、写结果 JSON）。本地评测工具（benchmark / bench）写 runs/ 下的中间产物时仍是原生
+OSError —— 那跑在开发者自己机器上，失败时就该看到完整系统错误，包一层反而挡信息（见
+benchmark.py 模块头）。别把「总是」理解成"包括我拿来改代码的那把锤子"。
 
 @doc README.md#6-api-速查
 （该文档解决"这个库会抛哪些异常、每个该在哪一层兜"的问题。）
@@ -84,14 +89,13 @@ class UnsupportedFeatureError(LocatorError, NotImplementedError):
 
 
 class OutputPathError(LocatorError, ValueError):
-    """标注图的输出路径不可用：空路径、认不出的扩展名、父目录建不出来、最终写不进去。
+    """标注图的输出路径**本身**不可用：空路径，或者扩展名认不出（只认 _FORMATS 里那几个）。
 
-    「最终写不进去」也归这里（原先是裸 OSError，见 WriteError 的说明）：
-    locate_to_file 是「一次调用把文件交到你手里」的入口，路径问题在调模型**之前**
-    就已经校验过一轮，走到最后一步还失败基本只有磁盘/权限这类原因 —— 但无论哪一类，
-    调用方要的都是同一件事：知道**哪个路径**出了什么问题，而不是拿到一个裸 OSError。
+    只管「路径这个字符串不对，改参数就行」这一档。至于「路径没问题但写不进去」
+    （父目录建不出来、磁盘满、只读）一律归 WriteError —— 两类问题的修法不同，
+    混在一起调用方就分不出该改参数还是改环境。原先两者都是裸的，见 WriteError。
 
-    继承 ValueError 同样是向后兼容：0.1.2 里 resolve_output_path 抛的是 ValueError，
+    继承 ValueError 同样是向后兼容：以前 resolve_output_path 抛的就是 ValueError，
     已有调用方可能正按 `except ValueError` 兜它。
     """
 

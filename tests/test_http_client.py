@@ -24,7 +24,12 @@ import pytest
 
 from qsmy_deepseek_locator import RequestsVisionClient
 from qsmy_deepseek_locator.config import Settings
-from qsmy_deepseek_locator.errors import APIError, EmptyResponseError, LocatorError
+from qsmy_deepseek_locator.errors import (
+    APIError,
+    EmptyResponseError,
+    LocatorError,
+    UnsupportedFeatureError,
+)
 from qsmy_deepseek_locator.request_build import build_request
 
 # 子进程测试要显式把 src 挂到 PYTHONPATH 上（子进程不会读 tests/conftest.py）
@@ -188,18 +193,44 @@ class TestStreamingAssembly:
         _reply(client, on_event=seen.append)
         assert [event["type"] for event in seen] == ["reasoning", "content", "finish"]
 
-    def test_response_is_closed_even_when_reading_fails(self, capture, monkeypatch):
-        """收完流必须 close（还回连接池）；中途炸了也必须 close（finally）。"""
+    def test_response_is_closed_after_a_normal_read(self, capture):
+        """收完流必须 close（还回连接池），否则连续调用会一直新建连接。"""
         make, calls = capture
         client = make(_sse(_delta(content="ok")))
         _reply(client)
         assert calls[0]["response"].closed is True
 
-        make2, calls2 = capture
-        client2 = make2(_sse(_delta(content="ok")))
-        monkeypatch.setattr(client2, "_payload", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
-        with pytest.raises(RuntimeError):
-            _reply(client2)
+    def test_response_is_closed_and_error_wrapped_when_the_stream_breaks(self, capture):
+        """**读流中途炸**（连接被掐）：要转成 APIError，而 finally 仍必须把响应关掉。
+
+        上一版这条其实没生效：它把 _payload 打桩成抛异常，而 _payload 跑在
+        session.post **之前** —— 请求压根没发出去，calls2 是空的，finally 那条路
+        一个断言都没走到（假绿）。现在改成让 iter_lines **读到一半**才抛。
+        """
+        make, calls = capture
+        client = make([])
+
+        class _BrokenResponse(_FakeResponse):
+            """吐一帧之后断线 —— 这就是「读流中途失败」的真实形状。"""
+
+            def iter_lines(self, decode_unicode=False):
+                yield b"data: " + json.dumps(_delta(content="前")).encode("utf-8")
+                raise ConnectionError("连接被对端掐断")
+
+        broken = _BrokenResponse([])
+
+        def _post(url, headers=None, json=None, stream=None, timeout=None):
+            calls.append({"url": url, "json": json, "response": broken})
+            return broken
+
+        # 直接替换这个客户端实例上的 post：这一次请求真的会发出去（calls 里有记录），
+        # 失败点落在**读流**那一段，正是要覆盖的那条路。
+        client.session.post = _post  # type: ignore[method-assign]
+        with pytest.raises(APIError) as excinfo:
+            _reply(client)
+        assert "读取流式响应失败" in str(excinfo.value)
+        assert isinstance(excinfo.value.__cause__, ConnectionError)
+        assert broken.closed is True, "读流失败也必须 close（finally 那条路）"
 
 
 class TestSseRobustness:
@@ -226,6 +257,29 @@ class TestSseRobustness:
         make, _calls = capture
         client = make(_sse(_delta(content="蓝色方块")))
         assert _reply(client).text == "蓝色方块"
+
+
+class TestUnsupportedStreamOff:
+    """stream=False 必须**明确报错**，不许静默忽略。
+
+    上一版这个形参只进了 build_request，被 _payload 里写死的 {"stream": True} 覆盖 ——
+    传 False 既不报错也不生效，是"参数看起来能用其实没用"的那类坑。
+    """
+
+    def test_stream_false_is_rejected_loudly(self, capture):
+        make, calls = capture
+        client = make(_sse(_delta(content="ok")))
+        with pytest.raises(UnsupportedFeatureError) as excinfo:
+            list(client.stream([{"role": "user", "content": "hi"}], stream=False))
+        assert "只支持流式" in str(excinfo.value)
+        assert calls == [], "报错要在发请求之前，别白花一次 API"
+
+    def test_stream_true_still_works(self, capture):
+        """负向对照：默认值与显式 True 都必须照常工作。"""
+        make, _calls = capture
+        client = make(_sse(_delta(content="ok")))
+        events = list(client.stream([{"role": "user", "content": "hi"}], stream=True))
+        assert any(event["type"] == "content" for event in events)
 
 
 class TestErrors:

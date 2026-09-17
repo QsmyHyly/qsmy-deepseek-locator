@@ -19,7 +19,7 @@
 
 为什么 openai 会装不上：它依赖 jiter 与 pydantic-core 两个 **Rust 扩展**，
 二者都没有 Android/aarch64 的 wheel（实测 pip install --dry-run openai 报
-"Target triple not supported by rustup"）。0.1.3 起 openai 已降级为可选依赖
+"Target triple not supported by rustup"）。openai 已降级为可选依赖
 （pip install qsmy-deepseek-locator[openai]），本模块就是那条「不装它也能用」的路。
 
 ## 为什么可以用鸭子类型喂事件解包
@@ -31,11 +31,21 @@ _events_from_chunk 全程用 getattr 访问 chunk 字段，不认任何 SDK 的�
 ## 与 DeepSeekVisionClient 的已知差别（诚实清单）
 
 - **没有自动重试**：SDK 的 max_retries 在这里不存在。网络抖动要靠调用方自己重试。
+  连带少一条退路：SDK 版碰到「HTTP 400 且报错点名 stream_options」会自动去掉它重发一次
+  （见 client.py 的 _create），这里没有 —— 不认 stream_options 的兼容服务在这条路上会**直接失败**。
 - **超时口径不同**：这里是 (连接超时 10s, 读超时 timeout)，读超时是「两次数据之间的静默」
-  ——与 SDK 的流式口径一致，只是数值固定成了 10s 连接超时。
+  ——与 SDK 的流式口径一致，只是数值固定成了 10s 连接超时。读超时的来源与 SDK 版一致：
+  本次调用的 settings.timeout（Locator(timeout=…) / QSML_TIMEOUT 那条路）优先，
+  没传才用构造时那个 timeout=90.0。这条是补的 —— 以前只读构造值，于是
+  "设置里的 timeout"在这条路上是个空开关。
 - **错误文案不同**：非 200 一律抛 APIError，消息里带 HTTP 状态码与响应体前 300 字符。
-- **不写 request / event / reply 这几行日志**：传了 log 也只写 error 一行。
-  想要完整日志请用 DeepSeekVisionClient，或者自己在等价位置调 log.write（见 debuglog.py 第 5 条）。
+- **日志少一类：没有 chunk 行**。request / event / reply / error 四类的键名与 SDK 版完全一致
+  （逐条对过 client.py），差别只有一处：debuglog 的 chunks=True 在 SDK 版会额外落**原始 SSE 帧**
+  （stream_events.py 那句 log.write("chunk", …)），这里拿到的已经是归一化后的事件，
+  没有原始帧可记 —— 也就是说 chunks=True 在这条路上会**安静地什么都不多写**。
+  要对原始报文请用 SDK 客户端，或按 debuglog.py 第 5 条自己补一行 log.write。
+- **只有流式一条路**：stream=False 会抛 UnsupportedFeatureError（本库一切调用都用流式，
+  见 client.py 的说明）。SDK 版那个形参在这里不是"能选但没用"，是明确不支持。
 
 @doc README.md#1-安装
 （该文档解决"不装 openai 怎么用这个库、两条客户端怎么选"的问题。）
@@ -52,7 +62,7 @@ import requests
 from .client import ChatReply, _accumulate_tool_calls, _events_from_chunk
 from .config import DEFAULT_BASE_URL, Settings
 from .debuglog import DebugLog
-from .errors import APIError
+from .errors import APIError, UnsupportedFeatureError
 from .request_build import build_request
 
 # 连接超时与读超时分开给：连接该快（10s 足够），读超时按 Settings.timeout
@@ -136,13 +146,26 @@ class RequestsVisionClient:
         stream: bool = True,
         tools: list[dict] | None = None,
         tool_choice: str | dict | None = None,
+        timeout: float | None = None,
         log: DebugLog | None = None,
     ):
         """逐段产出事件（与 DeepSeekVisionClient.stream 同一批事件、同一套字段）。
 
         收进基类不做的原因是两者共用不了任何实现（一个走 SDK、一个走 socket），
         但**事件契约必须一样**，见 client.py 里那张六种事件的表。
+
+        stream 形参与 SDK 版同名同默认值，但这里**只支持 True**：
+        本库的定位流程全程流式（空正文与思考 token 的判定都依赖流式拿到的 usage），
+        非流式这条路由 SDK 版负责。以前这个形参只进了 build_request、
+        却被 _payload 里的写死 {"stream": True} 覆盖 —— 传 False 既不报错也不生效，
+        是"参数看起来能用其实没用"的那类坑，所以改成直接拒绝。
         """
+        if stream is not True:
+            raise UnsupportedFeatureError(
+                f"RequestsVisionClient 只支持流式调用，收到 stream={stream!r}。"
+                "本库的定位流程固定用流式（思考 token 与 usage 的判定依赖它）；"
+                "确实要非流式请改用 DeepSeekVisionClient（pip install qsmy-deepseek-locator[openai]）。"
+            )
         effective = settings or Settings.from_env()
         if log is not None:
             # 与 SDK 版一样，请求体在**发出去之前**落盘。
@@ -154,13 +177,28 @@ class RequestsVisionClient:
         kwargs = build_request(
             effective, messages, stream=stream, tools=tools, tool_choice=tool_choice
         )
-        for event in self._events(kwargs, effective, log=log):
+        for event in self._events(kwargs, effective, timeout=timeout, log=log):
             if log is not None:
                 log.write("event", event)
             yield event
 
-    def _events(self, kwargs: dict, settings: Settings, *, log: DebugLog | None = None):
-        """发请求 + 读 SSE + 解包成事件（stream() 的实现体，单独拎出来便于阅读）。"""
+    def _events(
+        self,
+        kwargs: dict,
+        settings: Settings,
+        *,
+        timeout: float | None = None,
+        log: DebugLog | None = None,
+    ):
+        """发请求 + 读 SSE + 解包成事件（stream() 的实现体，单独拎出来便于阅读）。
+
+        timeout 是**本次调用**的读超时（来自 Settings.timeout，也就是 Locator(timeout=…) /
+        QSML_TIMEOUT 那条路），给 None 才用客户端构造时的那个。这条参数是补的：
+        以前这里只读 self.timeout，于是"设置里的 timeout 对自备客户端完全无效" ——
+        在只能用自备客户端的安卓上，那是**唯一**能调的超时开关，失效后表现是
+        "我明明设了 30 秒，它还是卡了 90 秒"，极难归因。
+        """
+        read_timeout = self.timeout if timeout is None else float(timeout)
         payload = self._payload(kwargs, settings)
         headers = {
             "Authorization": "Bearer " + self.api_key,
@@ -173,7 +211,7 @@ class RequestsVisionClient:
                 headers=headers,
                 json=payload,
                 stream=True,
-                timeout=(_CONNECT_TIMEOUT, self.timeout),
+                timeout=(_CONNECT_TIMEOUT, read_timeout),
             )
         except Exception as exc:  # noqa: BLE001 - requests 的异常种类太多，统一按本库口径抛
             if log is not None:
@@ -233,6 +271,7 @@ class RequestsVisionClient:
         on_event: Any = None,
         tools: list[dict] | None = None,
         tool_choice: Any = None,
+        timeout: float | None = None,
         log: Any = None,
     ) -> ChatReply:
         """收完整个流，返回 ChatReply（VisionClient 协议的 complete）。
@@ -249,7 +288,12 @@ class RequestsVisionClient:
         model_name = self.model or effective.model
 
         for event in self.stream(
-            messages, settings=effective, tools=tools, tool_choice=tool_choice, log=log
+            messages,
+            settings=effective,
+            tools=tools,
+            tool_choice=tool_choice,
+            timeout=timeout,
+            log=log,
         ):
             kind = event.get("type")
             if kind == "content":

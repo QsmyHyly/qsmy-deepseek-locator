@@ -162,7 +162,7 @@ class TestRunBenchmark:
         )
 
         class OneShot:
-            def complete(self, messages, *, settings=None, on_event=None):
+            def complete(self, messages, *, settings=None, on_event=None, timeout=None):
                 from qsmy_deepseek_locator.client import ChatReply
 
                 return ChatReply(text=text, model="fake", finish_reason="stop")

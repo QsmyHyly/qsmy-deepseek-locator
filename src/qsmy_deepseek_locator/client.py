@@ -116,7 +116,7 @@ class VisionClient(Protocol):
 
     settings 是**本次调用**生效的配置（单次覆盖就是靠它传下来的），None = 用客户端自己的配置。
 
-    ⚠️ **签名要和实现一样宽**（0.1.3 修）。协议原先只声明 messages/settings/on_event/log
+    ⚠️ **签名要和实现一样宽**（本次改动修）。协议原先只声明 messages/settings/on_event/log
     四个参数，而实现 DeepSeekVisionClient.complete() 还接受 tools / tool_choice —— 同一份
     文件里协议比实现窄。后果不是报错，而是**静默丢功能**：按协议写签名的自备客户端
     （安卓那台机器上只能自备，因为 openai 装不上）会把这两个参数吃掉，于是用户明明打开了
@@ -132,6 +132,7 @@ class VisionClient(Protocol):
         on_event: EventCallback | None = None,
         tools: list[dict] | None = None,
         tool_choice: str | dict | None = None,
+        timeout: float | None = None,
         log: DebugLog | None = None,
     ) -> ChatReply:
         ...
@@ -140,6 +141,11 @@ class VisionClient(Protocol):
     # 这样自备客户端、自己实现了本协议的老代码，不用日志功能时完全不受影响。
     # tools / tool_choice 同理：本库自己的 locate() 这一路不传它们（不替调用方声明工具），
     # 只有直接调 complete() 的调用方才用得上。
+    #
+    # timeout 是**本次调用的读超时**（Settings.timeout，来自 Locator(timeout=…) / QSML_TIMEOUT）。
+    # 协议里必须有它，否则自备客户端只能吃自己构造时的那个值 —— 安卓上只有自备客户端可用，
+    # 于是「设置里的 timeout」在那边整条失效（现象是"我设了 30 秒它还是卡了 90 秒"）。
+    # 库自己的 locate() 每次都会传它；不想要就按原样忽略即可。
 
 
 class DeepSeekVisionClient:
@@ -168,11 +174,11 @@ class DeepSeekVisionClient:
         try:
             from openai import OpenAI
         except ImportError as exc:  # pragma: no cover - 环境问题
-            # openai 自 0.1.3 起是**可选依赖**（它的 jiter / pydantic-core 是 Rust 扩展，
+            # openai 在本次改动后是**可选依赖**（它的 jiter / pydantic-core 是 Rust 扩展，
             # 安卓/aarch64 上没有 wheel，装了也白装）。所以这里要给出两条都走得通的路，
             # 而不是一句「装 openai」——在装不上的机器上，那句话等于没说。
             raise APIError(
-                "缺少依赖 openai（自 0.1.3 起它是可选依赖）。两种解法任选一种：\n"
+                "缺少依赖 openai（本次改动前它是必装依赖，现在是可选的）。两种解法任选一种：\n"
                 "  1) 装它：pip install qsmy-deepseek-locator[openai]\n"
                 "  2) 不装：改用本库自带的裸 HTTP 客户端 ——\n"
                 "     from qsmy_deepseek_locator import RequestsVisionClient\n"
@@ -294,6 +300,7 @@ class DeepSeekVisionClient:
         on_event: EventCallback | None = None,
         tools: list[dict] | None = None,
         tool_choice: str | dict | None = None,
+        timeout: float | None = None,
         log: DebugLog | None = None,
     ) -> ChatReply:
         """收完整个流，返回 ChatReply。
@@ -303,6 +310,11 @@ class DeepSeekVisionClient:
         **本方法不执行工具**，要不要跑、跑完怎么把结果发回去，都是调用方的事。
         log 给 DebugLog 时，除了 stream() 那些行，还会追一条 reply（完整响应体）
         与一条 error（空正文这类失败）。
+
+        timeout 在这里**只是个占位参数**：SDK 客户端每次请求都自己读 settings.timeout
+        （见 client_for 的 _client_key 与那里传的 timeout=），所以传进来的值不参与决策。
+        留着它是为了让协议与自备客户端长得一样 —— 库自己的 locate() 每次都传，
+        实现方少写一个形参就会直接 TypeError（那类"能不能换客户端"的问题最难查）。
         """
         effective = settings or self.settings
         text_parts: list[str] = []

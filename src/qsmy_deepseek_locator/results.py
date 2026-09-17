@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator
 
+from .errors import WriteError
 from .parsing import Detection, extract_json_block
 
 # 「没找到目标」的两种情形要分开说，否则用户会以为解析坏了：
@@ -160,10 +161,28 @@ class LocateResult:
         return json.dumps(self.to_dict(**kwargs), ensure_ascii=False, indent=indent)
 
     def save(self, path: str | Path, *, indent: int | None = 2, **kwargs: Any) -> Path:
-        """把 JSON 写到文件，返回写入路径。"""
+        """把 JSON 写到文件，返回写入路径。
+
+        Raises:
+            WriteError: 父目录建不出来或文件写不进去（磁盘满、只读、同名目录占了位置…）。
+                原始 OSError 挂在 __cause__ 上。
+
+        为什么这里也要包：它是**公开 API**，而本库对外的承诺是「抛出的东西总是
+        LocatorError」。这里曾漏在外面 —— 调用方按承诺只写 except LocatorError，
+        结果建目录失败时看到一个裸 OSError，得回去补 catch 才能收场。
+        """
         target = Path(path)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(self.to_json(indent=indent, **kwargs), encoding="utf-8")
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(self.to_json(indent=indent, **kwargs), encoding="utf-8")
+        except (OSError, ValueError, TypeError) as exc:
+            # TypeError 必须在内：json.dumps 碰到不可序列化的东西（raw_items 里塞了自定义
+            # 对象、message 之类）抛的是 TypeError 而不是 ValueError —— 这条以前只在注释里
+            # 写着"要包"，except 子句却没收，于是那种输入照样裸着出去（上一版就是这样）。
+            # 实测：LocateResult(raw_items=[object()]).save(p, include_raw=True)。
+            raise WriteError(
+                f"结果 JSON 写入失败：{target}（{type(exc).__name__}: {exc}）"
+            ) from exc
         return target
 
     def describe(self) -> str:

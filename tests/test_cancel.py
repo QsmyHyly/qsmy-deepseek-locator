@@ -24,13 +24,14 @@ BOX = '[{"bbox_2d": [0.25, 0.25, 0.75, 0.75], "label": "方块"}]'
 class _EventFiringClient:
     """假客户端：complete() 期间按预设节奏回调若干事件。"""
 
-    def __init__(self, text=BOX, events=("content", "content", "finish"), on_first=None):
+    def __init__(self, text=BOX, events=("content", "content", "finish"), on_first=None, on_last=None):
         self.text = text
         self.events = events
         self.on_first = on_first          # 第一次事件时执行（用来中途 set cancel_event）
+        self.on_last = on_last            # 最后一次事件之后执行（用来打"模型已返回"那个点）
         self.calls = 0
 
-    def complete(self, messages, *, settings=None, on_event=None, log=None):
+    def complete(self, messages, *, settings=None, on_event=None, timeout=None, log=None):
         self.calls += 1
         from qsmy_deepseek_locator import ChatReply
         for index, kind in enumerate(self.events):
@@ -38,6 +39,9 @@ class _EventFiringClient:
                 on_event({"type": kind, "text": self.text[:4]})
             if index == 0 and self.on_first is not None:
                 self.on_first()
+        if self.on_last is not None:
+            # 事件全发完、马上要对调用方说"答完了"——取消正好发生在这个空档
+            self.on_last()
         return ChatReply(text=self.text, model="fake")
 
 
@@ -62,18 +66,34 @@ def test_cancelled_mid_stream(sample_png):
     assert client.calls == 1, "第一轮该发出去（取消是中途发生的），但不该有第二轮"
 
 
-def test_cancelled_after_the_model_returns(sample_png):
-    """事件回调之后、结果返回之前 set —— 那段空档也要查一次。
+def test_cancelled_after_the_last_event(sample_png):
+    """**第三个检查点**：事件全回调完、模型已返回，此时 set 也要被拦下。
 
-    这一段没有事件经过，如果只在 on_event 上查，取消会「晚一轮才生效」，
-    调用方看到的是"点了取消，图还是画出来了"。
+    这一段没有任何事件经过 —— 如果只在 on_event 上查，取消会「晚一轮才生效」，
+    调用方看到的是"点了取消，图还是画出来了、钱也花了"。
+    构造方式：让假客户端在**发完最后一个事件之后**才 set，正好落在
+    locate() 里"reply 回来了、开始解析之前"那次检查上。
+
+    （这条是补的：上一版这里其实是"进门前 set"，与 docstring 说的不是同一条路，
+    等于第三个检查点一条断言都没有。）
     """
     event = threading.Event()
-    client = _EventFiringClient(events=())          # 一个事件都不回调
+    client = _EventFiringClient(events=("content",), on_last=event.set)
     locator = Locator(client=client, api_key="sk-test")
-    event.set()                                     # 进门前就 set，走的是"进门前检查"那条路
     with pytest.raises(CancelledError):
         locator.locate(sample_png, "方块", cancel_event=event)
+    assert client.calls == 1, "请求已经发出去、模型也答完了 —— 拦的是后续，不是这一轮"
+
+
+def test_cancelled_before_start_is_still_checked(sample_png):
+    """进门前 set：一次 API 调用都不该花（"点了取消还扣钱"是最招骂的 bug）。"""
+    event = threading.Event()
+    client = _EventFiringClient()
+    locator = Locator(client=client, api_key="sk-test")
+    event.set()
+    with pytest.raises(CancelledError):
+        locator.locate(sample_png, "方块", cancel_event=event)
+    assert client.calls == 0
 
 
 def test_no_cancel_event_keeps_old_behavior(sample_png):

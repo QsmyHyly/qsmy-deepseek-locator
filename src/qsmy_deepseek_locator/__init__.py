@@ -21,7 +21,7 @@
     2. **坐标只有一种口径：0.0~1.0 相对比例，小数位不设上限**。0~1000 旧刻度会被自动
        除以 1000 换算并留下告警，像素坐标则一律告警而不猜测 —— 详见 parsing.py 的模块说明。
 
-依赖只有三个：Pillow 与 requests 是必装，**openai 自 0.1.3 起是可选依赖**
+依赖只有三个：Pillow 与 requests 是必装，**openai 现在是可选依赖**
 （pip install qsmy-deepseek-locator[openai]）。不装 openai 也能完整使用本库 ——
 换成自带的自备客户端即可，它只用 requests：
 
@@ -163,7 +163,7 @@ __all__ = [
     "DEFAULT_SYSTEM_PROMPT",
     "DEFAULT_USER_PROMPT",
     "build_user_prompt",
-    # 异常（**本库抛出的东西总是 LocatorError**，0.1.3 起闭合）
+    # 异常（**本库抛出的东西总是 LocatorError**，本次改动后闭合）
     "LocatorError",
     "MissingAPIKeyError",
     "ImageLoadError",

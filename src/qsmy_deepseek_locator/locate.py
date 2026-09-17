@@ -21,7 +21,7 @@
     4. 解析正文（parsing.parse_detections：容错 + 旧刻度兜底 + 越界告警）
     5. 打包成 LocateResult（坐标 / 标签 / 耗时 / usage / 告警 / 原始项）
 
-**阻塞与取消（0.1.3 补）**：locate() 全程同步，最坏情况等 300s × (max_retries+1) = 900s。
+**阻塞与取消（本次改动补）**：locate() 全程同步，最坏情况等 300s × (max_retries+1) = 900s。
 调用方要么把它放进后台线程/子进程，要么传 cancel_event=threading.Event 换一个「取消」按钮
 （每个流式事件都会查一次开关，set() 之后抛 CancelledError）。本库**不会**主动取消任何请求。
 
@@ -45,8 +45,11 @@
 
 from __future__ import annotations
 
+import inspect
+import os
 import threading
 import time
+import warnings
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -84,6 +87,62 @@ _CANCEL_MESSAGE = (
     "调用已被 cancel_event 取消（调用方主动放弃，不是出错）。"
     "已经发出去的请求不会撤回，服务端可能仍在生成 —— 但本库不再等待、也不再解析结果。"
 )
+
+
+def _own_frames_above() -> int:
+    """从本函数往上数「还有几个栈帧属于本库」，用于把告警指到**调用方那一行**。
+
+    写死 stacklevel 是不行的：同一个 _complete 可能被 Locator.locate 调、被模块级
+    locate() 调、被 CLI 调，深度各不相同。写死的话，经 CLI 进来时告警会指到 cli.py 里
+    的一行 —— 用户照着那行去改自己的客户端，改了个寂寞。
+
+    返回 N 表示"本函数之上还有 N 个本库帧"，**不含本函数自己那一帧**（第一个 f_back 就已经
+    是调用方了）。调用点用 stacklevel=N+1：+1 回到本函数、+N 走到库内最外那一帧、
+    再 +1 才跨出库外 —— 也就是"库内帧数（含本函数）+1"。
+    实测：直接调用时 N=0（其余 0 个库内帧，stacklevel=1 就是 user 自己），
+    经 Locator.locate 调用时 N=1（stacklevel=2 = locate 的调用方 = user）。
+    **这个数是量出来的**：先前写成 +2 会落到 pytest 的 _pytest/python.py，写成 +3 落到 pluggy。
+    与 drawing.py 的 _own_frames_above 同源但计数口径差 1，改一处务必想想另一处。
+    这个套路与 drawing.py 的 _own_frames_above 同源，但计数口径差 1（那里是从"本函数"开始数），
+    改一处务必想想另一处 —— 写反了的表现是告警指回库内部，很难一眼看出来。
+    """
+    own = os.path.abspath(__file__)
+    frame = inspect.currentframe()
+    count = 0
+    try:
+        frame = frame.f_back if frame is not None else None
+        while frame is not None and os.path.abspath(frame.f_code.co_filename) == own:
+            count += 1
+            frame = frame.f_back
+    finally:
+        del frame
+    return count
+
+def _complete(client: Any, messages: list, **kwargs: Any) -> ChatReply:
+    """调客户端的 complete()，并对「老式自备客户端不认新形参」做一次优雅降级。
+
+    背景：timeout 是本次改动新加进协议的关键字参数，用来把生效后的读超时传给自备客户端
+    （安卓上只有它能用，SDK 那条路装不上）。但**已有的自备客户端是按旧协议写的**，
+    签名里没有 timeout —— 直接传就是 TypeError，等于把一次升级变成线上崩溃。
+
+    所以这里只对「TypeError 且报错文本点名 timeout」降级重试一次，并 **warnings.warn**
+    说明「你的客户端收不到本次的 timeout」。为什么不静默吞掉：静默意味着用户设的 30 秒
+    超时在这台机器上永远不生效，而现象只是「怎么还是卡这么久」，根本归因不到这里。
+    """
+    try:
+        return client.complete(messages, **kwargs)
+    except TypeError as exc:
+        if "timeout" not in str(exc) or "timeout" not in kwargs:
+            raise
+        warnings.warn(
+            f"{type(client).__name__}.complete() 不接受 timeout 参数，本次调用的读超时"
+            f"（{kwargs['timeout']}s）没有传给它，它会用自己构造时设的那个值。"
+            "按 VisionClient 协议补一个 timeout=None 形参（忽略即可）就能消除这条告警。",
+            UserWarning,
+            stacklevel=_own_frames_above() + 1,
+        )
+        fallback = {k: v for k, v in kwargs.items() if k != "timeout"}
+        return client.complete(messages, **fallback)
 
 
 def _cancellable(
@@ -250,10 +309,12 @@ class Locator:
         log_kwarg = {"log": log} if log is not None else {}
 
         started = time.perf_counter()
-        reply = active_client.complete(
+        reply = _complete(
+            active_client,
             messages,
             settings=effective,
             on_event=_cancellable(on_event, cancel_event),
+            timeout=effective.timeout,
             **log_kwarg,
         )
         duration_ms = (time.perf_counter() - started) * 1000.0

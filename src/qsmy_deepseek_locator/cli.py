@@ -180,7 +180,13 @@ def locate_main(argv: Sequence[str]) -> int:
         sys.stdout.write(result.describe() + "\n")
 
     if args.json_path:
-        saved = result.save(args.json_path, include_raw=True)
+        try:
+            saved = result.save(args.json_path, include_raw=True)
+        except LocatorError as exc:
+            # 以前这一行落在两个 except 之外：--json 写不进去时直接吐 traceback，
+            # 与「错误：<一句话> + 退出码 1」的既有承诺不符（脚本里也没法判）。
+            sys.stderr.write(f"\n错误：{exc}\n")
+            return 1
         sys.stderr.write(f"结果 JSON：{saved}\n")
 
     if not args.no_draw:

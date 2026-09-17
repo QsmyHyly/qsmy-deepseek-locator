@@ -83,7 +83,7 @@ def test_falsy_font_path_argument_falls_back_to_settings(cjk_font, tmp_path):
     from qsmy_deepseek_locator import Locator
 
     class _Client:
-        def complete(self, messages, *, settings=None, on_event=None, log=None):
+        def complete(self, messages, *, settings=None, on_event=None, timeout=None, log=None):
             from qsmy_deepseek_locator import ChatReply
             return ChatReply(text='[{"bbox_2d": [0.2, 0.2, 0.6, 0.6], "label": "猫"}]',
                              model="fake")
