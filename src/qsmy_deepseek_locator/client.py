@@ -222,6 +222,11 @@ class DeepSeekVisionClient:
         key = (settings.api_key, settings.base_url, settings.timeout, settings.max_retries)
         if self._client is not None and self._client_key == key:
             return self._client
+        # 先要 Key 再 import openai：两者都缺时，「没设 DEEPSEEK_API_KEY」是用户当场
+        # 就能自己修的那一个，而「没装 openai」是环境问题。反过来写会让最该看到的那条
+        # 报错被另一条整个盖住 —— 实测在安卓上（装不了 openai）缺 Key 的提示完全看不见，
+        # 只看到「缺少依赖 openai」，而装 openai 恰恰是那台机器上做不到的事。
+        api_key = settings.require_api_key()
         try:
             from openai import OpenAI
         except ImportError as exc:  # pragma: no cover - 环境问题
@@ -229,7 +234,7 @@ class DeepSeekVisionClient:
                 "缺少依赖 openai。安装：pip install openai（或 pip install qsmy-deepseek-locator）"
             ) from exc
         self._client = OpenAI(
-            api_key=settings.require_api_key(),
+            api_key=api_key,
             base_url=settings.base_url,
             timeout=settings.timeout,
             max_retries=settings.max_retries,

@@ -32,6 +32,13 @@
 4. **每行独立 open/append，不持有文件句柄**：跨进程、崩溃后追加都不会互相打架，
    也就不用管 close。一次调用百来行的开销相对一次 API 调用可以忽略。
 
+5. **自定义 VisionClient 要自己写这几行**。本模块只提供写入端：request / event / reply /
+   error 是 DeepSeekVisionClient 在收发时写的（见 client.py 的 complete / stream），
+   result 由 Locator.locate 收尾时补。换成实现 VisionClient 协议的自建客户端时，
+   若还想让日志可用，就得在等价位置自己调 log.write —— 否则日志里只会剩一条 result
+   （实测：安卓上自建的 requests 客户端正是如此，拿得到结果、看不到模型原始回复，
+   排查「是模型给错了还是我解析错了」时抓瞎）。
+
 ⚠️ 日志里**有完整的模型输入输出**（提示词、思考过程、坐标）。它适合自己排查，
 别默认往公共 CI artifact 或别人的机器上丢。
 

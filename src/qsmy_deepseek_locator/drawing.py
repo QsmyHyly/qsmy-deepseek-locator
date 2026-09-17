@@ -117,33 +117,164 @@ def _ratio_to_abs(value: float, total: int) -> int:
     return int(round(ratio * total))
 
 
-def _draw_label(draw: ImageDraw.ImageDraw, xy: tuple[float, float], text: str, color: str, font: Any) -> None:
-    """画带底色的小标签，保证在任意背景上都读得清（底色亮度决定黑字还是白字）。"""
+# 标签底色块四周的留白（px）。3 是历史值，别随手改：它同时决定了标签要在框上方
+# 预留多少、以及贴边时能夹出多少余量。
+_LABEL_PAD = 3
+
+# 标签避让的最多尝试次数。刻意取小：避让太激进会把标签推到离目标很远的地方，
+# 读图的人反而对不上它标的是哪个框 —— 宁可两个标签挨着，也不要它们各奔东西。
+_LABEL_AVOID_TRIES = 4
+
+# 不显式给 font_size / box_width / point_radius 时的历史默认值（scale_to_image=False 用）。
+_DEFAULT_FONT_SIZE = 22
+_DEFAULT_BOX_WIDTH = 3
+_DEFAULT_POINT_RADIUS = 5
+
+
+def _text_size(draw: ImageDraw.ImageDraw, text: str, font: Any) -> tuple[int, int, int, int]:
+    """量一段文字，返回 (left, top, width, height)。
+
+    why 连 left/top 一起返回：textbbox 在 (0, 0) 上量出的 left/top 通常不是 0
+    （字形自带 ascent/descent 偏移），绘制时必须把这两个偏移减掉，文字才会正正好
+    落在底色块里 —— 不减的话中文标签会贴着块的上沿、甚至冒出去一截。
+    某些内置位图字体没有 textbbox，退回一个够用的估算值。
+    """
     try:
-        left, top, right, bottom = draw.textbbox(xy, text, font=font)
-    except Exception:  # noqa: BLE001 - 某些内置字体没有 textbbox
-        draw.text(xy, text, fill=color, font=font)
-        return
-    pad = 3
-    draw.rectangle((left - pad, top - pad, right + pad, bottom + pad), fill=color)
+        left, top, right, bottom = draw.textbbox((0, 0), text, font=font)
+        return int(left), int(top), max(1, int(right - left)), max(1, int(bottom - top))
+    except Exception:  # noqa: BLE001
+        return 0, 0, max(1, len(text) * 8), 16
+
+
+def _overlaps(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> bool:
+    """两个矩形是否相交（边贴边不算）。"""
+    return a[0] < b[2] and b[0] < a[2] and a[1] < b[3] and b[1] < a[3]
+
+
+def _label_rect(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    font: Any,
+    anchor: tuple[float, float],
+    bounds: tuple[int, int] | None = None,
+    box: tuple[int, int, int, int] | None = None,
+    avoid: Sequence[tuple[int, int, int, int]] | None = None,
+) -> tuple[int, int, int, int]:
+    """算出标签底色块的最终矩形（画布坐标）。
+
+    这是「标签被切在图片外」那类问题的唯一现场，所以单独抽出来：单测可以直接断言
+    矩形，不必去数像素。放置顺序是有讲究的 ——
+
+    1. **贴顶放不下就翻到框内侧**：标签默认画在框上方（ay1 - 字高 - 6），目标贴着
+       图片上边时框外根本没地方，单纯夹紧只能把它压在顶上、上沿仍被切掉一条
+       （实测 1494x2047 的图上「天空」标签正好撞上这个）；翻进框内则一定在画布里。
+    2. **躲开已经画过的标签**：多目标密集时（实测一张图 17 个目标）标签会叠在一起，
+       向下挪一个标签高再试，最多 _LABEL_AVOID_TRIES 次。
+    3. **四边夹紧**：标签比画布还宽/高时，宁可让它压边，也不把文字裁掉。
+
+    Args:
+        anchor: 期望的标签左上角（含底色留白）。
+        bounds: 画布 (宽, 高)。给 None 表示不做任何约束（保持旧行为）。
+        box: 该目标的框像素坐标 (x1, y1, x2, y2)，用于第 1 步的翻转。
+        avoid: 已占用的标签矩形列表，用于第 2 步。
+
+    Returns:
+        (x1, y1, x2, y2)；给了 bounds 时保证落在画布内。
+    """
+    _l, _t, text_w, text_h = _text_size(draw, text, font)
+    w, h = text_w + 2 * _LABEL_PAD, text_h + 2 * _LABEL_PAD
+    x, y = int(anchor[0]), int(anchor[1])
+
+    if bounds is None:
+        return (x, y, x + w, y + h)
+
+    canvas_w, canvas_h = bounds
+
+    # 1. 顶边放不下 -> 翻到框内侧顶部
+    if box is not None and y < 0 and box[1] + h <= canvas_h:
+        y = box[1]
+
+    # 2. 躲开已画过的标签
+    if avoid:
+        for _ in range(_LABEL_AVOID_TRIES):
+            candidate = (x, y, x + w, y + h)
+            if not any(_overlaps(candidate, other) for other in avoid):
+                break
+            if y + h + 1 > canvas_h:
+                break
+            y += h + 1
+
+    # 3. 夹进画布：标签比画布宽/高时 min() 得到负数，被外层 max(0, ..) 兜住。
+    x = max(0, min(x, canvas_w - w))
+    y = max(0, min(y, canvas_h - h))
+    return (x, y, x + w, y + h)
+
+
+def _draw_label(
+    draw: ImageDraw.ImageDraw,
+    xy: tuple[float, float],
+    text: str,
+    color: str,
+    font: Any,
+    *,
+    bounds: tuple[int, int] | None = None,
+    box: tuple[int, int, int, int] | None = None,
+    avoid: Sequence[tuple[int, int, int, int]] | None = None,
+) -> tuple[int, int, int, int]:
+    """画带底色的小标签，保证在任意背景上都读得清（底色亮度决定黑字还是白字）。
+
+    Args:
+        xy: 期望位置（标签左上角）。给了 bounds 时可能被挪动，见 _label_rect。
+        bounds / box / avoid: 透传给 _label_rect。
+
+    Returns:
+        标签实际占据的矩形，供调用方登记进 avoid。
+    """
+    glyph_left, glyph_top, _tw, _th = _text_size(draw, text, font)
+    rect = _label_rect(draw, text, font, xy, bounds=bounds, box=box, avoid=avoid)
+
     try:
         rgb = ImageColor.getrgb(color)
         luminance = 0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2]
         text_color = (0, 0, 0) if luminance > 140 else (255, 255, 255)
     except Exception:  # noqa: BLE001
         text_color = (255, 255, 255)
-    draw.text(xy, text, fill=text_color, font=font)
+
+    draw.rectangle(rect, fill=color)
+    # 减掉字形自身的 left/top 偏移，文字才落在块里而不是顶在块外
+    draw.text(
+        (rect[0] + _LABEL_PAD - glyph_left, rect[1] + _LABEL_PAD - glyph_top),
+        text, fill=text_color, font=font,
+    )
+    return rect
+
+
+def _auto_style(width: int, height: int) -> tuple[int, int, int]:
+    """按图片尺寸推一组 (框线宽, 字号, 点半径)。
+
+    why 按**短边**算：文字是方的，按长边算会让狭长图上的字大到荒唐 —— 实测
+    1494x2047 的图按长边能得到 51px 的字，几乎盖住半个画面。分母 40 来自手调经验：
+    1600x1200 上得到 30px，与手工调优的 28 很接近；再夹到 12~48 防两端失控。
+
+    什么时候用得上：draw(..., scale_to_image=True)。默认不开，是因为它改变的是
+    观感而不是正确性，不该悄悄改掉已有调用方的输出。
+    """
+    short = max(1, min(width, height))
+    size = max(12, min(48, short // 40))
+    return max(1, int(round(size / 7.0))), size, max(2, int(round(size / 5.0)))
+
 
 
 def draw(
     image: Any,
     items: Any,
     *,
-    box_width: int = 3,
-    point_radius: int = 5,
-    font_size: int = 22,
+    box_width: int | None = None,
+    point_radius: int | None = None,
+    font_size: int | None = None,
     draw_label: bool = True,
     colors: Sequence[str] | None = None,
+    scale_to_image: bool = False,
 ) -> Image.Image:
     """在图片上画出 Detection（框 / 点 + 标签），返回新图（不改动入参图）。
 
@@ -151,14 +282,36 @@ def draw(
         image: 路径 / URL / bytes / PIL.Image / data URL。
         items: Detection 列表、模型字段字典列表，或模型输出的坐标 JSON 文本。
         colors: 自定义调色板；留空用内置 COLORS，按目标顺序取色。
+        box_width / point_radius / font_size: 显式指定；留 None 时用历史默认
+            （线宽 3 / 半径 5 / 字号 22），或按 scale_to_image 自适应。显式值优先级最高。
+        scale_to_image: 按图片尺寸自动推线宽 / 字号 / 半径。**大图配小字**是实测踩到的坑：
+            3px 的框线画在 4000px 宽的图上细得几乎看不见，22px 的标签同理。
+            默认 False —— 它改的是观感而不是正确性，不该悄悄改掉已有调用方的输出。
+        draw_label: 关掉可得到只有框、没有文字的干净标注图。
+
+    Returns:
+        画好的新图（RGB）。标签默认画在框上方；贴图片边缘时会翻到框内侧、被别的标签
+        压住时会向下错开，四边都保证不越界 —— 规则见 _label_rect。
     """
     img = load_image(image).convert("RGB")
     detections = coerce_detections(items)
     palette = list(colors) if colors else COLORS
     width, height = img.size
 
+    if scale_to_image:
+        auto_box, auto_font, auto_radius = _auto_style(width, height)
+    else:
+        auto_box, auto_font, auto_radius = (
+            _DEFAULT_BOX_WIDTH, _DEFAULT_FONT_SIZE, _DEFAULT_POINT_RADIUS,
+        )
+    box_width = auto_box if box_width is None else box_width
+    font_size = auto_font if font_size is None else font_size
+    point_radius = auto_radius if point_radius is None else point_radius
+
     painter = ImageDraw.Draw(img)
     font = resolve_font(font_size)
+    # 已经画出去的标签矩形，用来给后面的标签让位（见 _label_rect 第 2 步）
+    placed: list[tuple[int, int, int, int]] = []
 
     for index, det in enumerate(detections):
         color = palette[index % len(palette)] if palette else "red"
@@ -174,7 +327,12 @@ def draw(
                 ay1, ay2 = ay2, ay1
             painter.rectangle(((ax1, ay1), (ax2, ay2)), outline=color, width=box_width)
             if draw_label and label:
-                _draw_label(painter, (ax1, max(0, ay1 - font_size - 6)), label, color, font)
+                # 这里不再做 max(0, ..)：位置交给 _label_rect 统一决定，它还要负责
+                # 「贴顶翻进框内」和「躲开别的标签」两件事。
+                placed.append(_draw_label(
+                    painter, (ax1, ay1 - font_size - 6), label, color, font,
+                    bounds=(width, height), box=(ax1, ay1, ax2, ay2), avoid=placed,
+                ))
 
         if det.point is not None:
             cx, cy = _ratio_to_abs(det.point[0], width), _ratio_to_abs(det.point[1], height)
@@ -184,9 +342,13 @@ def draw(
             )
             painter.ellipse([(cx - 1, cy - 1), (cx + 1, cy + 1)], fill=color)
             if draw_label and label:
-                _draw_label(painter, (cx + point_radius + 4, cy + 2), label, color, font)
+                placed.append(_draw_label(
+                    painter, (cx + point_radius + 4, cy + 2), label, color, font,
+                    bounds=(width, height), avoid=placed,
+                ))
 
     return img
+
 
 
 def save_annotated(

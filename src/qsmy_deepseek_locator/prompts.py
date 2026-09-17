@@ -69,12 +69,19 @@ DEFAULT_SYSTEM_PROMPT = (
 DEFAULT_USER_PROMPT = "识别图中的主要物体，逐个输出中文名称与坐标。"
 
 
+# 这些词开头的 target 自带「全部」的意思，句式里的「所有的」要省掉，
+# 否则会拼出「请找出图中所有的所有物体」这种重复句（实测 deepseek-flash 仍能
+# 正确理解，但措辞明显是坏的，而且暴露了句式写死这件事）。
+_ALL_INCLUSIVE = ("所有", "全部", "每个", "各个", "一切", "整张", "整个", "全部")
+
+
 def build_user_prompt(target: str | None = None) -> str:
     """把「找什么」拼成用户消息。
 
     Args:
         target: 目标描述，例如 "红色圆形"、"登录按钮"、"画面里的人"。
             为空则返回 DEFAULT_USER_PROMPT（= 识别主要物体）。
+            以「所有 / 全部 / 每个」等量词开头时，句式不再叠加「所有的」。
 
     Returns:
         用户消息文本。注意这里**只描述找什么，不描述坐标怎么给** ——
@@ -83,6 +90,8 @@ def build_user_prompt(target: str | None = None) -> str:
     text = (target or "").strip()
     if not text:
         return DEFAULT_USER_PROMPT
+    if text.startswith(_ALL_INCLUSIVE):
+        return f"请找出图中的{text}，逐个输出中文名称与坐标。"
     return f"请找出图中所有的{text}，逐个输出中文名称与坐标。"
 
 

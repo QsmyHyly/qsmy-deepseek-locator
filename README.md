@@ -94,7 +94,7 @@ print(result.labels)           # ['红色圆形']
 | `use_tools` | `False` | 工具（Agent）调用：v0.1 未实现，传 `True` 会**当场报错**而不是被静默忽略 |
 | `prompt` | `None` | 直接给**整段**用户消息（给了就忽略第二个位置参数 `target`）。⚠️ 它不会自动套上本库那句「请找出图中所有的…」包装句式，所以「找什么」请走 `target` |
 | `model` / `base_url` / `timeout` / `max_tokens` / `max_side` / `system_prompt` | 见第 6 节 | 与 `Locator.locate()` 同名同义 |
-| `colors` / `box_width` / `point_radius` / `font_size` / `draw_label` | 见 `drawing.draw` | 绘制样式 |
+| `colors` / `box_width` / `point_radius` / `font_size` / `draw_label` / `scale_to_image` | 见 `drawing.draw` | 绘制样式 |
 
 几条已定好的行为，不必去猜：
 
@@ -259,6 +259,7 @@ result = locator.locate(
 ```python
 draw(image, result)                       # -> PIL.Image（不改动入参图）
 draw(image, result, box_width=4, font_size=26, draw_label=True)
+draw(image, result, scale_to_image=True)  # 线宽/字号按图片尺寸自动推（大图不再细到看不见）
 save_annotated(image, result, path="out.png")     # -> Path
 ```
 
@@ -454,6 +455,14 @@ A：**不会**。`tools` 原样透传、调用请求拼好放在 `ChatReply.tool
   想严格拦截就传 `max_side=`（例如 `max_side=1600`），那条路径会真的解码图片。
 - **定位是「框出大概位置」，不是像素级分割。** 不做 NMS、不去重，同一个目标可能出现两个框；
   框的精度受模型限制（每张图服务端只算 384 token）。
+- **同一张图多次调用，返回的目标集合不保证一致。** 本库不发送任何采样参数
+  （`temperature` / `top_p` / `seed` 一个都没设），每次调用都是一次独立采样。实测同一张图、
+  同一目标连跑三次，目标数给出过 `17 / 10 / 8` 这样的差别，命名与粒度也跟着变；
+  **反倒是同一个目标的位置相对稳**（实测同一栋楼三轮中心点相差 1.5~2%）。所以结果看着"飘"时，
+  先怀疑「这一次框了哪些目标」，而不是「坐标算错了」。要复现性就自己多跑几次按 label 聚类投票。
+- **标注图的标签会自动避让，落点不保证和框的位置一一对应。** 标签默认画在框上方，贴图片
+  边缘时翻进框内侧、被别的标签压住时向下错开，四边都保证不越出画布 —— 想完全固定位置，
+  就自己拿 `Detection` 列表用 PIL 画。
 - **0.1.0 没有 Agent / 工具执行循环。** `use_tools=True` 直接抛 `NotImplementedError`；
   `client.complete(..., tools=[...])` 能拿到完整工具调用参数，但本库不替你执行。
 - **实测只跑过 CPython 3.11 与 3.12。** `requires-python = ">=3.9"` 是按语法静态核对的

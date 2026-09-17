@@ -12,6 +12,7 @@ import threading
 import pytest
 from PIL import Image
 
+from qsmy_deepseek_locator import drawing
 from qsmy_deepseek_locator.drawing import coerce_detections, draw, save_annotated
 from qsmy_deepseek_locator.errors import ImageLoadError
 from qsmy_deepseek_locator.images import (
@@ -238,3 +239,85 @@ class TestDraw:
         assert painted, "整张图一个像素都没改：越界点没被夹回画布"
         # 夹紧后落在右下角（5.0 -> 1.0 -> 像素 100，圆心在画布外的角上）
         assert min(x for x, _ in painted) >= 90 and min(y for _, y in painted) >= 90
+
+
+class TestLabelPlacement:
+    """标签放置：四边夹紧 / 贴顶翻转 / 互相避让。
+
+    这一组针对 2026-09-17 实测到的问题：标签只夹了上边、右边完全没管，
+    1494x2047 的图上靠右目标的标签被画布切掉（图上显示成「高层建…」）。
+    """
+
+    @staticmethod
+    def _canvas(size=(400, 300)):
+        from PIL import ImageDraw
+        return ImageDraw.Draw(Image.new("RGB", size, "white"))
+
+    def test_label_rect_stays_inside_canvas_on_the_right(self):
+        """靠右目标的标签必须整体落在画布内 —— 这正是被切掉的那一类。"""
+        rect = drawing._label_rect(
+            self._canvas(), "一个相当长的中文标签", drawing.resolve_font(16),
+            (380, 100), bounds=(400, 300),
+        )
+        assert rect[2] <= 400, "标签右边缘越界: %r" % (rect,)
+        assert rect[0] >= 0 and rect[1] >= 0 and rect[3] <= 300
+
+    def test_label_rect_clamps_on_every_edge(self):
+        """四个方向各给一个必然越界的起点，结果都要落回画布内。"""
+        painter = self._canvas()
+        font = drawing.resolve_font(16)
+        for anchor in [(-50, -50), (400, 150), (-50, 150), (150, 320)]:
+            rect = drawing._label_rect(painter, "边界标签", font, anchor, bounds=(400, 300))
+            assert rect[0] >= 0 and rect[1] >= 0, "左上越界: %r" % (rect,)
+            assert rect[2] <= 400 and rect[3] <= 300, "右下越界: %r" % (rect,)
+
+    def test_label_never_gets_a_negative_origin_at_the_top(self):
+        """目标贴着图片顶边时，标签原点不得为负。
+
+        旧写法只做 max(0, ay1 - 字高 - 6)，原点确实是 0，但底色块还要往外扩 pad，
+        于是上沿仍被削掉一条；这里要求整个矩形都在画布内。
+        """
+        rect = drawing._label_rect(
+            self._canvas(), "顶部目标", drawing.resolve_font(16),
+            (10, -30), bounds=(400, 300), box=(10, 0, 200, 80),
+        )
+        assert rect[1] >= 0, "上沿仍越界: %r" % (rect,)
+
+    def test_labels_avoid_each_other(self):
+        """同一位置的两个标签，后一个要让开而不是叠上去。"""
+        painter = self._canvas()
+        font = drawing.resolve_font(16)
+        first = drawing._label_rect(painter, "标签甲", font, (10, 10), bounds=(400, 300))
+        second = drawing._label_rect(painter, "标签乙", font, (10, 10), bounds=(400, 300), avoid=[first])
+        assert not drawing._overlaps(first, second), "两个标签仍然重叠: %r / %r" % (first, second)
+
+    def test_no_bounds_keeps_the_old_behaviour(self):
+        """不给 bounds 时不做任何约束（老调用方与单测依赖这一点）。"""
+        rect = drawing._label_rect(self._canvas(), "自由标签", drawing.resolve_font(16), (380, 100))
+        assert rect[0] == 380 and rect[1] == 100
+
+    def test_draw_with_edge_hugging_boxes_still_paints_labels(self):
+        """端到端：四个角都放目标，draw 不该抛异常，而且标签确实画上去了。"""
+        img = Image.new("RGB", (300, 200), (255, 255, 255))
+        dets = [
+            Detection(label="左上", bbox=(0.0, 0.0, 0.2, 0.2)),
+            Detection(label="右上", bbox=(0.8, 0.0, 1.0, 0.2)),
+            Detection(label="右下", bbox=(0.8, 0.8, 1.0, 1.0)),
+            Detection(label="左下", bbox=(0.0, 0.8, 0.2, 1.0)),
+        ]
+        with_labels = draw(img, dets, font_size=14)
+        without = draw(img, dets, font_size=14, draw_label=False)
+        assert with_labels.tobytes() != without.tobytes(), "标签没被画上去"
+
+    def test_scale_to_image_sizes_the_font_to_the_canvas(self):
+        """scale_to_image 让小图用更小的字号，且不改变显式传参的优先级。"""
+        small = drawing._auto_style(400, 300)
+        large = drawing._auto_style(2400, 1800)
+        assert small[1] < large[1], "大图的字号应当更大: %r vs %r" % (small, large)
+        assert small[1] >= 12 and large[1] <= 48, "字号没有夹在 12~48: %r / %r" % (small, large)
+        # 显式传的值优先
+        img = Image.new("RGB", (400, 300), (255, 255, 255))
+        det = [Detection(label="", bbox=(0.2, 0.2, 0.8, 0.8))]
+        assert draw(img, det, scale_to_image=True, box_width=1).tobytes() == \
+            draw(img, det, box_width=1).tobytes()
+
