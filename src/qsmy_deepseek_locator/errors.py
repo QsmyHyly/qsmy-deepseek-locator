@@ -7,6 +7,33 @@
 刻意**不做**的事：不在缺 Key 时静默降级成假数据。旧演示项目（deepseek-vision-annotation）
 无 Key 时会进 Mock 模式，那对演示页很友好，但对一个库是危险的：
 用户会拿到一堆看起来正常的坐标，却以为真的调用了模型。本库缺 Key 就报错。
+
+**契约闭合（0.1.3）**：0.1.2 及以前，除了下面这些 LocatorError 之外还会漏出三类裸异常 ——
+`NotImplementedError`（use_tools=True）、`ValueError`（输出路径后缀 / log_file 类型）、
+`OSError`（标注图最终落盘那行没有 try/except）。只写 `except LocatorError` 的调用方
+会在最后一步落盘上崩掉，而异常类型也不在文档承诺里 —— 安卓 App 那边正是因此只能抓
+`BaseException` 兜底。现在这三类全部收进本模块：
+
+    裸异常                            现在抛的                    多重继承
+    NotImplementedError               UnsupportedFeatureError     LocatorError, NotImplementedError
+    ValueError（输出路径）             OutputPathError            LocatorError, ValueError
+    ValueError（log_file 类型）        LogFileTypeError           LocatorError, ValueError
+    OSError（最终落盘 / 建目录）        WriteError                 LocatorError（见下）
+
+**为什么前面三个子类要做多重继承**：只继承 LocatorError 的话，「原来的 `except ValueError`
+抓不住」就成了一次**静默的行为破坏** —— 调用方代码一行没改，异常却从 except 的缝里漏出去。
+多重继承同时满足两边：老写法照旧抓到，新写法 `except LocatorError` 一把兜住，
+`isinstance(exc, ValueError)` 这类判断也仍然成立。代价是继承图稍微绕一点，
+换来的是一条硬承诺：**这个库抛出的东西，总是 LocatorError**。
+
+**唯一的例外是文件系统的 OSError，刻意不给它留退路**。WriteError 只继承 LocatorError，
+不继承 OSError：一来 OSError 是本库最不擅长判断的一类错误（磁盘满、只读挂载、权限、
+路径长度……原因全在调用方那边，本库只能转述），并进来没给调用方任何新信息；
+二来 OSError 的 `__init__` 有自己的一套 args 语义（errno / strerror），混着用会让异常对象的
+`args` 说不清，而排查时看的恰恰是它。原始 OSError **一个都不会丢** —— 一律挂在 `__cause__` 上。
+
+@doc README.md#6-api-速查
+（该文档解决"这个库会抛哪些异常、每个该在哪一层兜"的问题。）
 """
 
 from __future__ import annotations
@@ -45,10 +72,68 @@ class EmptyResponseError(LocatorError):
     """
 
 
+class UnsupportedFeatureError(LocatorError, NotImplementedError):
+    """调用了本版本还没有实现的功能（当前只有一处：locate_to_file(use_tools=True)）。
+
+    它是**预留参数**的报错，不是「参数传错了」：v0.1 没有实现工具（Agent）调用循环，
+    而 use_tools 留在签名里，是为了将来接上时不必改调用方。静默忽略它会让用户以为
+    工具已经开了 —— 那比报错危险得多，所以这里宁可当场炸。
+
+    继承 NotImplementedError 是为了向后兼容：0.1.2 抛的就是它（见模块头）。
+    """
+
+
+class OutputPathError(LocatorError, ValueError):
+    """标注图的输出路径不可用：空路径、认不出的扩展名、父目录建不出来、最终写不进去。
+
+    「最终写不进去」也归这里（原先是裸 OSError，见 WriteError 的说明）：
+    locate_to_file 是「一次调用把文件交到你手里」的入口，路径问题在调模型**之前**
+    就已经校验过一轮，走到最后一步还失败基本只有磁盘/权限这类原因 —— 但无论哪一类，
+    调用方要的都是同一件事：知道**哪个路径**出了什么问题，而不是拿到一个裸 OSError。
+
+    继承 ValueError 同样是向后兼容：0.1.2 里 resolve_output_path 抛的是 ValueError，
+    已有调用方可能正按 `except ValueError` 兜它。
+    """
+
+
+class WriteError(LocatorError):
+    """写文件失败（标注图落盘、输出目录创建）。
+
+    与 OutputPathError 分开，是因为两者对应**不同的修法**：OutputPathError 是「路径本身不对，
+    改参数」，WriteError 是「路径对但写不动，改环境」——磁盘满、只读挂载、没有写权限。
+
+    刻意**不**继承 OSError，理由见模块头最后一段。原始 OSError 永远挂在 `__cause__` 上。
+    """
+
+
+class LogFileTypeError(LocatorError, ValueError):
+    """log_file 参数的类型不认识（只接受 None / True / False / 路径 / DebugLog）。
+
+    单独成类而不是随便抛个 ValueError：日志是个「以为自己开了、其实没开」会非常难受的东西，
+    所以类型不认识时宁可报错也不静默忽略（见 debuglog.coerce_log）；给它一个能按名字兜的类型，
+    调用方就不必去比对报错文本。
+    """
+
+
+class CancelledError(LocatorError):
+    """调用被 cancel_event 取消了。
+
+    只在调用方**自己**传了 cancel_event 时才可能出现 —— 本库不会主动取消任何请求。
+    语义是「调用方改主意了」，不是「出错了」：重试没有意义，清理后直接返回即可。
+    它继承 LocatorError 但**不**继承 InterruptedError / KeyboardInterrupt，
+    免得被别的兜底逻辑当成系统级中断处理。
+    """
+
+
 __all__ = [
     "LocatorError",
     "MissingAPIKeyError",
     "ImageLoadError",
     "APIError",
     "EmptyResponseError",
+    "UnsupportedFeatureError",
+    "OutputPathError",
+    "WriteError",
+    "LogFileTypeError",
+    "CancelledError",
 ]

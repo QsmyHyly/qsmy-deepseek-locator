@@ -112,9 +112,16 @@ def load_bytes(source: Any, *, timeout: float = 60.0) -> tuple[bytes, str]:
 
 
 def load_image(source: Any, *, timeout: float = 60.0) -> Image.Image:
-    """加载成 PIL 图（RGB 或 RGBA）。
+    """加载成 PIL 图（**原样保留**源图的模式：RGB / RGBA / L / P 都可能）。
 
-    为什么保留 RGBA：带透明通道的 PNG 转 RGB 会糊成黑底，打标后没法看。
+    为什么这里不做 convert("RGB")：**本函数的职责只是"把源读成 PIL 图"，不是"准备一张能画的图"**，
+    用哪张图做什么是调用方的事。透明度该不该丢、什么时候丢，取决于下游要干什么 ——
+    打标那条路确实要 RGB（drawing.draw 第一行就 convert("RGB")，因为 ImageDraw 的
+    抗锯齿与色彩混合在带 alpha 的图上是另一套行为），但"下载/读取"这一步就把信息扔掉，
+    会让「读出来交给别的库处理」的调用方拿不到原本的通道。
+
+    ⚠️ 旧注释曾写「保留 RGBA 是因为转 RGB 会糊成黑底」，那句话与实现不符 ——
+    drawing.draw 的第一行就是 .convert("RGB")，糊不糊根本轮不到这里管；真正的理由如上。
     """
     if isinstance(source, Image.Image):
         return source.copy()

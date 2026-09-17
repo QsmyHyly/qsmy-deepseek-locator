@@ -46,9 +46,28 @@ python -m venv .venv && .venv\Scripts\activate      # Windows；macOS/Linux 用 
 pip install -e ".[dev]"
 ```
 
-依赖只有三个：`openai`（DeepSeek 走 OpenAI 兼容协议）、`Pillow`（读图 / 打标）、`requests`（下载图片 URL）。
+**必装依赖只有两个**：`Pillow`（读图 / 打标）与 `requests`（下载图片 URL + 裸 HTTP 客户端）。
 
-跑自测（187 个用例，**全程离线、不花 API**）：
+`openai` 自 **0.1.3 起是可选依赖**：它依赖的 `jiter` / `pydantic-core` 都是 **Rust 扩展**，
+没有 Android/aarch64 的 wheel（`pip install --dry-run openai` 会报
+`Target triple not supported by rustup`），在手机上「照文档装一遍」是装不上的。
+不装它也能完整使用本库 —— 换成自带的自备客户端即可，它只用 `requests`：
+
+```bash
+pip install qsmy-deepseek-locator            # 最小安装（不含 openai）
+pip install "qsmy-deepseek-locator[openai]"  # 想要 SDK 的重试与连接池时
+```
+
+```python
+from qsmy_deepseek_locator import Locator, RequestsVisionClient
+
+locator = Locator(client=RequestsVisionClient(api_key="sk-xxx"), thinking=False)
+result = locator.locate("photo.png", "红色圆形")
+```
+
+两个客户端的差别（重试、超时口径、日志详略）写在 `http_client.py` 的模块头里。
+
+跑自测（**全程离线、不花 API**）：
 
 ```bash
 python -m pytest tests -q
@@ -224,6 +243,7 @@ locator = Locator(
     max_tokens=None,       # 输出上限（含思考 token）
     timeout=300,            # 单次请求超时（秒）；恒走流式，超时按「两次数据之间的静默」算
     max_side=None,         # 发送前把图缩到最长边不超过它（省流量，不影响坐标精度）
+    font_path=None,        # 中文标签用的字体文件；None = 自动探测（见第 8 节）
 )
 ```
 
@@ -237,7 +257,13 @@ result = locator.locate(
     prompt=None,           # 直接给完整用户消息（给了就忽略 target）
     system_prompt=None,    # 覆盖系统提示词 —— 承载坐标口径，慎改
     on_event=print,        # 流式事件回调：reasoning/content/tool_call/finish/usage/model（见第 7 节）
+    cancel_event=None,     # threading.Event；set() 之后在下一个流式事件处抛 CancelledError
 )
+```
+
+> ⚠️ **所有入口都是同步阻塞调用。** 最坏等待是 `timeout × (max_retries + 1)`，
+> 默认就是 **300s × 3 = 900s**。别在主线程 / UI 线程里直接调 —— 安卓上会 ANR，
+> 桌面 GUI 会卡住窗口。移动端与 GUI 请丢进后台线程，并用 `cancel_event` 接一个「取消」按钮。
 ```
 
 `LocateResult` 上有什么：
@@ -260,8 +286,27 @@ result = locator.locate(
 draw(image, result)                       # -> PIL.Image（不改动入参图）
 draw(image, result, box_width=4, font_size=26, draw_label=True)
 draw(image, result, scale_to_image=True)  # 线宽/字号按图片尺寸自动推（大图不再细到看不见）
+draw(image, result, font_path="/system/fonts/NotoSansCJK-Regular.ttc")   # 指定中文字体
 save_annotated(image, result, path="out.png")     # -> Path
 ```
+
+### 6.1 异常一览（0.1.3 起闭合：抛出的东西**总是** `LocatorError`）
+
+| 异常 | 什么时候抛 | 额外继承 |
+|---|---|---|
+| `LocatorError` | 基类，`except LocatorError` 一把兜住 | — |
+| `MissingAPIKeyError` | 三处都没给 Key | — |
+| `ImageLoadError` | 路径不存在 / URL 下载失败 / 字节不是有效图片 | — |
+| `APIError` | 网络、鉴权、限流、服务端 5xx、读流中途断连（原始异常在 `__cause__`） | — |
+| `EmptyResponseError` | 正文为空（九成是思考 token 吃光了 `max_tokens`） | — |
+| `UnsupportedFeatureError` | `use_tools=True`（v0.1 没有 Agent 循环） | `NotImplementedError` |
+| `OutputPathError` | 输出路径空 / 后缀不认识 | `ValueError` |
+| `LogFileTypeError` | `log_file` 的类型不认识 | `ValueError` |
+| `WriteError` | 输出目录建不出来、标注图最终写不进去（原始 `OSError` 在 `__cause__`） | — |
+| `CancelledError` | 你传的 `cancel_event` 被 `set()` 了 | — |
+
+「额外继承」那一列是**向后兼容**：0.1.2 及以前这些路径抛的就是裸的 `NotImplementedError` /
+`ValueError`，保留继承关系，旧的 `except` 子句才不会被静默漏接。取舍写在 `errors.py` 模块头。
 
 ## 7. 看过程：流式事件
 
@@ -362,6 +407,30 @@ A：不用管，**本库内部恒走流式**（报文里固定带 `stream: true`
 真挂住时的最坏等待是 `timeout × (max_retries + 1)`，默认即 300s × 3，
 想收紧就传 `timeout=60` 或设 `QSML_TIMEOUT`。
 
+**Q：中文标签变成方块（豆腐块）了怎么办？**
+A：说明没找到含中文字形的字体，库已经退回 PIL 内置位图字体 —— **并且会发一条 UserWarning 提醒你**
+（0.1.3 之前这一步是静默的，图能正常出、只有标签是豆腐块，很难发现）。三种给法任选一种：
+
+```python
+resolve_font(22, font_path="/system/fonts/NotoSansCJK-Regular.ttc")   # 1) 当场指定
+```
+
+```bash
+export QSML_FONT_PATH=/system/fonts/NotoSansCJK-Regular.ttc   # 2) 指定字体文件
+export QSML_FONT_DIR=/system/fonts                           # 3) 只指定探测目录
+```
+
+也可以走配置：`Locator(font_path=...)`，或写进 `Settings.font_path`（跟着 `merged()` 走）。
+探测顺序是**字体名优先**（外循环名字、内循环目录），而且选中后会**真渲染一遍确认它有中文字形**
+—— 只看文件名会踩坑：安卓上 `/system/fonts/DroidSans.ttf` 是 Roboto 的软链，
+名字像中文字体、实际只有拉丁字形。
+
+**Q：调用会不会卡住主线程？能中途取消吗？**
+A：**会卡，而且可能卡几分钟** —— 全部入口都是同步阻塞的，最坏 `timeout × (max_retries + 1)`；
+所以别在主线程 / UI 线程里调。要能中途喊停就传 `cancel_event=threading.Event()`：
+`set()` 之后，本库会在**下一个流式事件到达时**抛 `CancelledError`（进门前、每个事件、
+模型返回后三个检查点）。注意它不会撤回已经发出去的请求，服务端可能仍在生成。
+
 **Q：模型一个目标都没找到，是报错吗？**
 A：不是。`result.empty` 为真、`warnings` 里会说清是「模型明确回了空数组」还是「正文里没有坐标」。
 后者通常意味着提示词没被遵守，该改提示词而不是重试。
@@ -390,6 +459,13 @@ A：有，见第 7 节。一句话版：给 `locate` / `locate_to_file` 传 `on_
 
 **Q：异常该怎么兜？网络中途断了抛什么？**
 A：全都继承 `LocatorError`，`except LocatorError` 一把兜住即可，具体的子类见第 6 节。
+
+**0.1.3 起这个承诺是闭合的**：以前还会漏出三类裸异常 —— `NotImplementedError`（`use_tools=True`）、
+`ValueError`（输出路径后缀不认识 / `log_file` 类型不认识）、`OSError`（标注图最终落盘那行）。
+现在它们分别变成 `UnsupportedFeatureError` / `OutputPathError` / `LogFileTypeError` / `WriteError`，
+且**全部多重继承**（`LocatorError` + 原来那个基类），所以旧的 `except ValueError` /
+`except NotImplementedError` 照旧抓得住，不会被静默漏接。
+唯一的例外是 `WriteError`：它**不**继承 `OSError`（理由与 `__cause__` 的去向写在 `errors.py` 模块头）。
 **流跑到一半**才断（服务端断连、读超时、流里回一个 error 事件）也算 —— 本库会把它包成
 `APIError`，原始异常挂在 `__cause__` 上，不会丢。所以 CLI 那种「接口报错就退出码 1 加一句
 错误：…」的承诺，对中途失败同样成立。
@@ -411,7 +487,9 @@ A：**不会**。`tools` 原样透传、调用请求拼好放在 `ChatReply.tool
 - 其余说明按「文档就近写在代码里」的原则放在模块头注释：
   `prompts.py`（提示词为什么这么写）、`parsing.py`（刻度兜底与为何不猜）、
   `images.py`（编码策略）、`drawing.py`（中文字体）、`benchmark.py`（评测口径）、
-  `debuglog.py`（调试日志记什么、为什么不记图片）。
+  `debuglog.py`（调试日志记什么、为什么不记图片）、
+  `http_client.py`（不装 openai 时用哪个客户端、两个客户端差在哪）、
+  `errors.py`（异常为什么要多重继承、`WriteError` 为什么不继承 `OSError`）。
 
 ## 10. 与 `deepseek-vision-annotation` 的关系
 
@@ -463,7 +541,15 @@ A：**不会**。`tools` 原样透传、调用请求拼好放在 `ChatReply.tool
 - **标注图的标签会自动避让，落点不保证和框的位置一一对应。** 标签默认画在框上方，贴图片
   边缘时翻进框内侧、被别的标签压住时向下错开，四边都保证不越出画布 —— 想完全固定位置，
   就自己拿 `Detection` 列表用 PIL 画。
-- **0.1.0 没有 Agent / 工具执行循环。** `use_tools=True` 直接抛 `NotImplementedError`；
+- **0.1.0 没有 Agent / 工具执行循环。** `use_tools=True` 直接抛 `UnsupportedFeatureError`（也是 `NotImplementedError`）；
   `client.complete(..., tools=[...])` 能拿到完整工具调用参数，但本库不替你执行。
+- **已知欠账：默认提示词里还没有「框选纪律」。** 安卓 App 在真机上实测到：延伸型 / 背景型目标
+  （天空、地面、道路、头发、建筑群……）的框习惯性贴边、甚至覆盖整幅图，而独立小物体
+  （罐子、领带、人脸）框得很准 —— 不是解析问题（`raw_items` 与 `detections` 逐字一致），
+  是提示词没交代「框该收在哪」。反馈文档里有一版实测有效的追加文案（平均框面积缩小 41%、
+  全幅框 1 -> 0）。**本轮没做**：`prompts.py` 自己定了规矩 —— 改它任何一句话都必须重跑
+  `bench` 再下结论，而重跑要花真钱、要重新对齐 ground truth；而且这一条会改变所有既有用户的
+  输出分布（框更小不总是更好：目标若真是大范围比如「天空」，过分收缩反而会漏）。
+  证据与文案见本文档第 9 节提到的反馈文档 P0-3 节。
 - **实测只跑过 CPython 3.11 与 3.12。** `requires-python = ">=3.9"` 是按语法静态核对的
   （全部模块都有 `from __future__ import annotations`，没有 3.10+ 独有语法），没有真在 3.9 / 3.10 上跑过。

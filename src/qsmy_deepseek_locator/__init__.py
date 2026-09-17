@@ -21,6 +21,22 @@
     2. **坐标只有一种口径：0.0~1.0 相对比例，小数位不设上限**。0~1000 旧刻度会被自动
        除以 1000 换算并留下告警，像素坐标则一律告警而不猜测 —— 详见 parsing.py 的模块说明。
 
+依赖只有三个：Pillow 与 requests 是必装，**openai 自 0.1.3 起是可选依赖**
+（pip install qsmy-deepseek-locator[openai]）。不装 openai 也能完整使用本库 ——
+换成自带的自备客户端即可，它只用 requests：
+
+    from qsmy_deepseek_locator import Locator, RequestsVisionClient
+    locator = Locator(client=RequestsVisionClient(api_key="sk-xxx"))
+    result = locator.locate("photo.png", "红色圆形")
+
+openai 之所以可选，是因为它依赖的 jiter / pydantic-core 都是 Rust 扩展，
+安卓（aarch64）上没有 wheel，装了也白装 —— 而「在一个装不上 SDK 的环境里用这个库」
+是完全正当的用法。
+
+⚠️ **所有入口都是同步阻塞调用**，一次 locate 最坏可能等 900s（300s 超时 × 3 次尝试）。
+别在主线程 / UI 线程里调；要能中途喊停就传 cancel_event=threading.Event，
+它在下一个流式事件到达时抛 CancelledError。
+
 想看「到底发出去什么、模型回了什么」，给任何入口传 log_file（**默认不开**）：
 
     locate("photo.png", "红色圆形", log_file="runs/logs/run.jsonl")
@@ -38,6 +54,9 @@ from .client import (
     build_messages,
     build_request,
 )
+# 裸 HTTP 客户端：不依赖 openai，只依赖 requests。给装不上 openai 的环境用
+# （安卓 / aarch64），用法与 DeepSeekVisionClient 完全一样，见 http_client.py 的对照表。
+from .http_client import RequestsVisionClient
 from .config import (
     DEFAULT_BASE_URL,
     DEFAULT_MODEL,
@@ -57,10 +76,15 @@ from .drawing import (
 )
 from .errors import (
     APIError,
+    CancelledError,
     EmptyResponseError,
     ImageLoadError,
     LocatorError,
+    LogFileTypeError,
     MissingAPIKeyError,
+    OutputPathError,
+    UnsupportedFeatureError,
+    WriteError,
 )
 from .images import encode_data_url, load_image, source_size, to_data_url
 from .locate import LocateResult, Locator, locate, locate_to_file
@@ -108,6 +132,7 @@ __all__ = [
     # 配置与客户端
     "Settings",
     "DeepSeekVisionClient",
+    "RequestsVisionClient",   # 纯 requests，不需要 openai
     "VisionClient",
     "ChatReply",
     "build_messages",
@@ -138,12 +163,17 @@ __all__ = [
     "DEFAULT_SYSTEM_PROMPT",
     "DEFAULT_USER_PROMPT",
     "build_user_prompt",
-    # 异常
+    # 异常（**本库抛出的东西总是 LocatorError**，0.1.3 起闭合）
     "LocatorError",
     "MissingAPIKeyError",
     "ImageLoadError",
     "APIError",
     "EmptyResponseError",
+    "UnsupportedFeatureError",
+    "OutputPathError",
+    "WriteError",
+    "LogFileTypeError",
+    "CancelledError",
     # 元信息
     "__version__",
 ]

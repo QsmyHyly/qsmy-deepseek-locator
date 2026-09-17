@@ -56,6 +56,8 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from .errors import LogFileTypeError
+
 # 短字符串（路径、URL、普通文本）原样保留，只有 data: 开头且超过这个长度的才省略 ——
 # 图片是唯一会长成这样的东西，而这个阈值远大于任何正常的提示词或标签。
 _DATA_URL_MIN = 128
@@ -169,8 +171,9 @@ def coerce_log(value: Any = None, *, chunks: bool = False) -> DebugLog | None:
         路径       开，写到这里；空串按「不开」处理（.env 里写 QSML_LOG_FILE= 是常见写法）
         DebugLog  原样使用（chunks 等细节由调用方自己定）
 
-    认不出的类型直接抛 ValueError：日志是个「以为自己开了其实没开」会很难受的东西，
-    静默忽略比报错危险。
+    认不出的类型直接抛 LogFileTypeError：日志是个「以为自己开了其实没开」会很难受的东西，
+    静默忽略比报错危险。它同时继承 ValueError（0.1.2 抛的就是它，老写法照旧抓得住）
+    与 LocatorError（只兜基类的调用方也抓得住），取舍见 errors.py 模块头。
     """
     if value is None or value is False:
         return None
@@ -181,7 +184,7 @@ def coerce_log(value: Any = None, *, chunks: bool = False) -> DebugLog | None:
     if isinstance(value, (str, Path)):
         text = str(value).strip()
         return DebugLog(text, chunks=chunks) if text else None
-    raise ValueError(
+    raise LogFileTypeError(
         f"log_file 只接受 None / True / False / 路径 / DebugLog，收到 {type(value).__name__}"
     )
 

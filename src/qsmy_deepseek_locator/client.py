@@ -115,6 +115,13 @@ class VisionClient(Protocol):
     """客户端协议。测试里注入假客户端只需要实现这一个方法。
 
     settings 是**本次调用**生效的配置（单次覆盖就是靠它传下来的），None = 用客户端自己的配置。
+
+    ⚠️ **签名要和实现一样宽**（0.1.3 修）。协议原先只声明 messages/settings/on_event/log
+    四个参数，而实现 DeepSeekVisionClient.complete() 还接受 tools / tool_choice —— 同一份
+    文件里协议比实现窄。后果不是报错，而是**静默丢功能**：按协议写签名的自备客户端
+    （安卓那台机器上只能自备，因为 openai 装不上）会把这两个参数吃掉，于是用户明明打开了
+    「工具」开关，模型却永远收不到工具清单；现象与「模型这次恰好不想调工具」无法区分。
+    所以这里把两个参数补进来 —— 纯增量，对已有实现与调用方都没有影响。
     """
 
     def complete(
@@ -123,12 +130,16 @@ class VisionClient(Protocol):
         *,
         settings: "Settings | None" = None,
         on_event: EventCallback | None = None,
+        tools: list[dict] | None = None,
+        tool_choice: str | dict | None = None,
         log: DebugLog | None = None,
     ) -> ChatReply:
         ...
 
     # 注：log **只在开启日志时**才会被传进来（见 locate.py 里那个 log_kwarg）。
     # 这样自备客户端、自己实现了本协议的老代码，不用日志功能时完全不受影响。
+    # tools / tool_choice 同理：本库自己的 locate() 这一路不传它们（不替调用方声明工具），
+    # 只有直接调 complete() 的调用方才用得上。
 
 
 class DeepSeekVisionClient:
@@ -157,8 +168,16 @@ class DeepSeekVisionClient:
         try:
             from openai import OpenAI
         except ImportError as exc:  # pragma: no cover - 环境问题
+            # openai 自 0.1.3 起是**可选依赖**（它的 jiter / pydantic-core 是 Rust 扩展，
+            # 安卓/aarch64 上没有 wheel，装了也白装）。所以这里要给出两条都走得通的路，
+            # 而不是一句「装 openai」——在装不上的机器上，那句话等于没说。
             raise APIError(
-                "缺少依赖 openai。安装：pip install openai（或 pip install qsmy-deepseek-locator）"
+                "缺少依赖 openai（自 0.1.3 起它是可选依赖）。两种解法任选一种：\n"
+                "  1) 装它：pip install qsmy-deepseek-locator[openai]\n"
+                "  2) 不装：改用本库自带的裸 HTTP 客户端 ——\n"
+                "     from qsmy_deepseek_locator import RequestsVisionClient\n"
+                "     locator = Locator(client=RequestsVisionClient(api_key='sk-xxx'))\n"
+                "     它只依赖 requests，与 openai 完全无关（安卓 App 就是这么跑的）。"
             ) from exc
         self._client = OpenAI(
             api_key=api_key,

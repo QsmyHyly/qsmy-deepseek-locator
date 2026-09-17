@@ -21,6 +21,10 @@
     4. 解析正文（parsing.parse_detections：容错 + 旧刻度兜底 + 越界告警）
     5. 打包成 LocateResult（坐标 / 标签 / 耗时 / usage / 告警 / 原始项）
 
+**阻塞与取消（0.1.3 补）**：locate() 全程同步，最坏情况等 300s × (max_retries+1) = 900s。
+调用方要么把它放进后台线程/子进程，要么传 cancel_event=threading.Event 换一个「取消」按钮
+（每个流式事件都会查一次开关，set() 之后抛 CancelledError）。本库**不会**主动取消任何请求。
+
 本模块**不做**的三件事，都是有意的：
     - 不静默降级。没有 API Key 就抛 MissingAPIKeyError，不返回假的坐标。
     - 不自动重试「模型没找到目标」这种结果。空结果与调用失败是两回事，前者是正常答案。
@@ -41,6 +45,7 @@
 
 from __future__ import annotations
 
+import threading
 import time
 from pathlib import Path
 from typing import Any, Sequence
@@ -54,8 +59,10 @@ from .client import (
 )
 from .config import Settings, api_key_from_env
 from .debuglog import coerce_log
-from .drawing import resolve_output_path
-from .errors import LocatorError
+# _prepare_dir 是私有的，但在本包里共用它正是「同一个实现只允许有一份」：
+# 「输出目录建不出来」的报错措辞与异常类型只该由 drawing 那一处定义。
+from .drawing import _prepare_dir, resolve_output_path
+from .errors import CancelledError, UnsupportedFeatureError, WriteError
 from .images import describe_source, source_size, to_data_url
 # extract_json_block 原本只因 results 那段解析逻辑在本文件里而顺带可见（不是本模块的职责）。
 # 留下来是为了不切断任何旧 import 路径：本仓库看不出来谁在用，代价只有一行。
@@ -69,6 +76,42 @@ from .results import (
     LocateResult,
     _returned_empty_array,
 )
+
+
+# 取消时抛的异常用同一句文案。写成常量是为了让调用方在日志/UI 里能按文案匹配，
+# 也免得两个检查点说的话不一样。
+_CANCEL_MESSAGE = (
+    "调用已被 cancel_event 取消（调用方主动放弃，不是出错）。"
+    "已经发出去的请求不会撤回，服务端可能仍在生成 —— 但本库不再等待、也不再解析结果。"
+)
+
+
+def _cancellable(
+    on_event: EventCallback | None, cancel_event: "threading.Event | None"
+) -> EventCallback | None:
+    """把 on_event 包一层，在每个流式事件到达时查一次取消开关。
+
+    为什么挂在 on_event 上而不是自己去遍历事件流：事件回调是**已经存在**的注入点，
+    库的客户端每收到一个 chunk 就调它一次（实测一次定位 122 条事件），粒度足够细；
+    为此再给 VisionClient 协议加一个参数，等于让所有自备客户端都跟着改签名 ——
+    那正是 P1-8 刚修完的那类问题，不该再制造一个。
+
+    没传 cancel_event 时**原样返回**（连包装都不包）：不改变任何现有行为，
+    自备客户端拿到的还是它自己那个回调对象。
+
+    包装后的回调是同步抛 CancelledError —— 异常会从客户端的事件循环里一路穿出来，
+    客户端自身的清理（关闭响应流）由它的 finally 负责，本函数不管这件事。
+    """
+    if cancel_event is None:
+        return on_event
+
+    def _wrapped(event: dict) -> None:
+        if cancel_event.is_set():
+            raise CancelledError(_CANCEL_MESSAGE)
+        if on_event is not None:
+            on_event(event)
+
+    return _wrapped
 
 
 class Locator:
@@ -132,8 +175,14 @@ class Locator:
         client: VisionClient | None = None,
         on_event: EventCallback | None = None,
         log_file: Any = None,
+        cancel_event: "threading.Event | None" = None,
     ) -> LocateResult:
         """定位一张图里的目标。
+
+        ⚠️ **这是个同步阻塞调用，可能阻塞数分钟**（默认 timeout=300s × (max_retries+1) = 900s
+        是最坏情况），**不要在主线程 / UI 线程里直接调** —— 安卓上那样会 ANR，
+        桌面 GUI 上会卡住整个窗口。移动端 / GUI 请丢进后台线程或子进程。
+        想在阻塞期间能喊停，传 cancel_event（见下）。
 
         Args:
             image: 图片源：本地路径 / http(s) URL / bytes / PIL.Image / data URL。
@@ -155,11 +204,22 @@ class Locator:
                 （该文档解决"日志里有什么、怎么读、什么该记什么不该记"的问题。）
                 自备 client 时：本库只在日志开启时才会把 log 传给它，所以不用日志的老客户端
                 不受影响；一旦开了日志，那个客户端就得接受 log 关键字参数（VisionClient 协议已含）。
+            cancel_event: 取消开关（threading.Event）。调用方 set() 之后，本方法会在
+                **下一个流式事件到达时**抛 CancelledError。检查点有三处：进入方法时、
+                每个流式事件、以及模型返回之后。不传就完全保持旧行为（不检查、不打断）。
 
         Returns:
             LocateResult。**模型没找到目标时不会抛异常**，而是返回 detections 为空的结果 ——
             与「调用失败」区分开（后者抛 APIError / EmptyResponseError / MissingAPIKeyError）。
+
+        Raises:
+            CancelledError: cancel_event 被 set 了（只可能由调用方自己触发）。
+            其余异常见 errors.py；本库抛出的东西**总是** LocatorError。
         """
+        if cancel_event is not None and cancel_event.is_set():
+            # 进来时已经取消了就别发请求了 —— 一次调用可能花掉真金白银，
+            # 「点了取消还扣一次钱」是最让人恼火的那种 bug。
+            raise CancelledError(_CANCEL_MESSAGE)
         effective = self.settings.merged(
             api_key=api_key,
             base_url=base_url,
@@ -191,9 +251,16 @@ class Locator:
 
         started = time.perf_counter()
         reply = active_client.complete(
-            messages, settings=effective, on_event=on_event, **log_kwarg
+            messages,
+            settings=effective,
+            on_event=_cancellable(on_event, cancel_event),
+            **log_kwarg,
         )
         duration_ms = (time.perf_counter() - started) * 1000.0
+        # 模型返回后、解析之前再查一次：事件回调是"边收边查"，最后一个事件之后
+        # 到 complete() 返回之间还有一段时间（拼工具调用、写日志），那段空档不能漏。
+        if cancel_event is not None and cancel_event.is_set():
+            raise CancelledError(_CANCEL_MESSAGE)
 
         detections, warnings, raw_items = parse_detections(reply.text)
         if not detections and reply.text.strip() and not warnings:
@@ -229,23 +296,55 @@ class Locator:
         target: str | None = None,
         *,
         output: str | Path | None = None,
+        box_width: int = 3,
+        point_radius: int = 5,
+        font_size: int = 22,
+        draw_label: bool = True,
+        colors: "Sequence[str] | None" = None,
+        font_path: "str | Path | None" = None,
         **kwargs: Any,
     ):
         """定位并直接把结果画回图上，返回 (LocateResult, PIL.Image)。
 
-        output 给了就顺手存成 PNG（路径原样返回在 result 里由调用方自己记）。
-        这是个便利方法：只要坐标不要图的场景请直接用 locate()；
+        output 给了就顺手落盘。这是个便利方法：只要坐标不要图的场景请直接用 locate()；
         只要「画好的图片文件」的场景请用 locate_to_file()（它会校验路径、按后缀定格式，
         并把落盘路径写进 result.annotated_path）。
+
+        绘制参数（box_width / point_radius / font_size / draw_label / colors / font_path）
+        在这里是**显式形参**，与 Locator.locate_to_file 完全同名同义 —— 以前它们被塞进
+        **kwargs 再转给 locate()，而 locate() 没有这些形参，于是要么 TypeError、
+        要么（更糟）被默默忽略：`Locator(font_path=…)` 在这条路上曾整条失效，
+        中文标签照样画成方块，调用方却以为自己已经指定好了。
+
+        ⚠️ 与 locate() 一样是**同步阻塞**调用，别在主线程里调。
         """
         from .drawing import draw
 
         result = self.locate(image, target, **kwargs)
-        annotated = draw(image, result.detections)
+        annotated = draw(
+            image,
+            result.detections,
+            box_width=box_width,
+            point_radius=point_radius,
+            font_size=font_size,
+            draw_label=draw_label,
+            colors=colors,
+            # 与 locate_to_file 同一口径：显式给了就用它，没给才回落到 Settings.font_path。
+            font_path=font_path or self.settings.font_path,
+        )
         if output:
-            target_path = Path(output)
-            target_path.parent.mkdir(parents=True, exist_ok=True)
-            annotated.save(target_path, format="PNG")
+            # 与 save_annotated / locate_to_file 走同一条路径解析：以前这里写死
+            # format="PNG" 且直接 mkdir+save，于是「.jpg 后缀得到 PNG 字节」和
+            # 「裸 OSError 漏出 LocatorError 契约」这两个问题在这一条路上都还在。
+            target_path, fmt = resolve_output_path(output)
+            _prepare_dir(target_path.parent)
+            try:
+                annotated.save(target_path, format=fmt)
+            except (OSError, ValueError) as exc:
+                raise WriteError(
+                    f"标注图写入失败：{target_path}（{type(exc).__name__}: {exc}）\n"
+                    "识别已经完成，只是图没落盘；换个可写目录重试即可，不必再调一次模型。"
+                ) from exc
         return result, annotated
 
 
@@ -275,8 +374,14 @@ class Locator:
         font_size: int = 22,
         draw_label: bool = True,
         colors: Sequence[str] | None = None,
+        font_path: str | Path | None = None,
+        cancel_event: "threading.Event | None" = None,
     ) -> LocateResult:
         """定位 + 打标 + 落盘：一次调用把「已经画好框的图片文件」交到你手里。
+
+        ⚠️ **这是个同步阻塞调用，可能阻塞数分钟**（默认 timeout=300s × (max_retries+1) = 900s
+        是最坏情况），**不要在主线程 / UI 线程里直接调**。移动端与 GUI 请丢进后台线程，
+        并给 cancel_event 留一个「取消」按钮。
 
             from qsmy_deepseek_locator import locate_to_file
 
@@ -310,8 +415,9 @@ class Locator:
                 @doc docs/API-NOTES.md#3-图片-token-与尺寸
                 （该文档解决"detail 到底改变了什么、为什么堆分辨率没用"的问题。）
             use_tools: 是否开启工具（Agent）调用。v0.1 **没有实现工具循环**，只能保持 False；
-                传 True 会当场抛 NotImplementedError。这是预留参数：宁可报错，
-                也不静默忽略 —— 静默忽略会让你以为工具已经开了。
+                传 True 会当场抛 UnsupportedFeatureError（同时也是 NotImplementedError，
+                0.1.2 抛的就是它）。这是预留参数：宁可报错，也不静默忽略 ——
+                静默忽略会让你以为工具已经开了。
                 想自己接工具请走底层：DeepSeekVisionClient.complete(messages, tools=[...])，
                 调用结果落在 ChatReply.tool_calls。本库负责透传报文与拼回分片，**不执行工具**。
                 @doc docs/API-NOTES.md#61-工具调用也是流式的而且一个字符一个-chunk
@@ -323,7 +429,8 @@ class Locator:
             log_file: 调试日志（请求体 / 事件流 / 响应体 / 结果 / 异常写成 JSONL）。
                 None = 按配置/环境变量，False = 明确关闭，路径 = 写到该文件，True = 自动路径。
                 **默认不开。** 日志记的是「发给模型什么、模型回了什么」，见 debuglog.py。
-            box_width / point_radius / font_size / draw_label / colors: 绘制样式，见 drawing.draw。
+            box_width / point_radius / font_size / draw_label / colors / font_path: 绘制样式与字体，
+                见 drawing.draw。font_path 也接受从 Settings.font_path 继承（构造 Locator 时给）。
 
         Returns:
             LocateResult。「annotated_path」是刚写出的文件路径（相对路径按当前工作目录解析）；
@@ -335,7 +442,7 @@ class Locator:
             与 locate() 内部 source_size 的行为一致。
         """
         if use_tools:
-            raise NotImplementedError(
+            raise UnsupportedFeatureError(
                 "use_tools=True 目前不可用：v0.1 没有实现工具（Agent）调用循环。\n"
                 "这个参数是预留给调用点的，传 True 会当场报错而不是被静默忽略 —— "
                 "静默忽略会让你以为工具已经开了，那比报错危险得多。\n"
@@ -349,15 +456,14 @@ class Locator:
 
         # 先校验输出路径再调模型：这是**故意**的顺序，一次 API 调用不该因为路径拼错而白花。
         # 父目录也在这里一并建出来，而不是等画完再 mkdir：路径不可写（父级是个文件、
-        # 没有写权限）属于「本地输入问题」，不该花掉一次 API 调用才暴露；
-        # 而且裸 OSError 不是 LocatorError，调用方的 except LocatorError 抓不住它。
+        # 没有写权限）属于「本地输入问题」，不该花掉一次 API 调用才暴露。
+        #
+        # P2-1 的由来：默认输出位置相对 CWD，而安卓上 CWD 通常是 / 或不可写目录，
+        # 「相对路径 + 不可写」叠在一起时调用方拿到的只是一句原生 OSError。
+        # 现在路径问题一律是 OutputPathError / WriteError（都是 LocatorError），
+        # 报错里带**具体路径**与常见原因，见 drawing._prepare_dir。
         path, fmt = resolve_output_path(output)
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-        except OSError as exc:
-            raise LocatorError(
-                f"输出目录无法使用：{path.parent}（{type(exc).__name__}: {exc}）"
-            ) from exc
+        _prepare_dir(path.parent)
 
         result = self.locate(
             image,
@@ -375,6 +481,7 @@ class Locator:
             max_side=max_side,
             on_event=on_event,
             log_file=log_file,
+            cancel_event=cancel_event,
         )
 
         from .drawing import draw
@@ -387,8 +494,22 @@ class Locator:
             font_size=font_size,
             draw_label=draw_label,
             colors=colors,
+            # 显式给了就用它；没给才回落到 Settings.font_path（可能是构造 Locator 时给的，
+            # 也可能是 QSML_FONT_PATH）。resolve_font 自己也读环境变量，这里传下去只是
+            # 让「Settings 里的值」这条更明确的路也成立 —— 两者最终指向同一个文件。
+            font_path=font_path or self.settings.font_path,
         )
-        annotated.save(path, format=fmt)  # 父目录已在调模型之前建好，见上面那段注释
+        try:
+            annotated.save(path, format=fmt)  # 父目录已在调模型之前建好，见上面那段注释
+        except (OSError, ValueError) as exc:
+            # 反馈里点名的那处「最终落盘那行没有 try/except」就是这里。
+            # 它是最难受的失败位置：钱已经花了、结果也解析出来了，只在最后一步写不进去。
+            # 所以文案必须说清「不用再调一次模型」，否则用户第一反应是重跑。
+            raise WriteError(
+                f"标注图写入失败：{path}（{type(exc).__name__}: {exc}）\n"
+                "识别已经完成，只是图没落盘（常见原因：磁盘满、目录只读、同名的目录占了位置）。"
+                "换个可写目录或传绝对路径重试即可，**不必再调一次模型**。"
+            ) from exc
         result.annotated_path = str(path)
         return result
 
@@ -411,6 +532,9 @@ def locate(image: Any, target: str | None = None, **kwargs: Any) -> LocateResult
     与 locate 的调用参数。函数内部用一次调用把两者都消化掉，方便脚本里一行搞定。
 
     只想反复调用时请自己建 Locator —— 每次 locate() 都会重新读环境变量并新建客户端。
+
+    ⚠️ 与 Locator.locate 一样是**同步阻塞**调用（最坏 timeout × (max_retries+1)），
+    别在主线程里调；要能中途停下就传 cancel_event=threading.Event()。
     """
     locator_kwargs, call_kwargs = _split_kwargs(kwargs)
     locator = Locator(**locator_kwargs)
@@ -437,6 +561,8 @@ def locate_to_file(
             thinking=True,           # 默认 False（显式关闭思考）
             image_detail="high",     # 默认 "original"
             use_tools=False,         # v0.1 只能是 False，传 True 会报错
+            font_path="/system/fonts/NotoSansCJK-Regular.ttc",   # 指定中文字体（默认自动探测）
+            cancel_event=threading.Event(),   # 想要「取消」按钮时给（见 Locator.locate）
         )
         print(result.annotated_path)  # 实际写出的文件（没写扩展名时会补 .png）
 
@@ -444,7 +570,7 @@ def locate_to_file(
 
         - Locator 构造参数：settings / client / max_side / max_retries；
         - 单次调用参数：api_key / thinking / image_detail / prompt / model / ... ；
-        - 绘制参数：colors / box_width / point_radius / font_size / draw_label。
+        - 绘制参数：colors / box_width / point_radius / font_size / draw_label / font_path。
 
     反复出图时请自己建一个 Locator 再调用它的 locate_to_file() ——
     这个函数每次都会重新读环境变量并新建客户端（和 locate() 是同一个取舍）。

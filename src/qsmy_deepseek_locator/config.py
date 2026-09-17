@@ -146,6 +146,15 @@ class Settings:
     # 这里只收路径，别收 DebugLog 对象 —— Settings 是要能序列化、能比较的配置，
     # 「日志写到哪」是配置，「日志对象怎么构造」不是。转换见 debuglog.coerce_log()。
     log_file: str | None = None
+    # 中文标签要用的字体文件路径。None = 自动探测（见 drawing.resolve_font）。
+    #
+    # 为什么它该进 Settings：调用方一旦自己建 Locator，就会用 Locator(font_path=...) 或
+    # Settings 传配置，而字体在**打标阶段**才用得上 —— 值必须能一路活到 draw()，
+    # 中途每一层都手工透传一遍才叫真的容易漏（App 那边原先只能 monkeypatch 私有函数）。
+    # 它跟着 merged() 走，所以 Locator(settings=..., font_path=...) 这类写法也能生效。
+    #
+    # 注意它**不是**「发给模型」的参数：不进报文，只影响画标签那一步。
+    font_path: str | None = None
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -163,6 +172,12 @@ class Settings:
             max_tokens=_env_int("QSML_MAX_TOKENS"),
             system_prompt=_env_str("QSML_SYSTEM_PROMPT") or DEFAULT_SYSTEM_PROMPT,
             log_file=_env_str("QSML_LOG_FILE"),
+            # 环境变量名与 drawing.FONT_PATH_ENV 是同一个串（QSML_FONT_PATH）。
+            # 这里写字面量而不 import drawing：config 是被所有模块 import 的底座，
+            # 让它反过来 import 一个要拉起 PIL 的模块，会让「只想用解析/提示词」的人
+            # 也被迫加载 Pillow —— 那正是 P0-2 要避免的那类依赖绑架。
+            # 两边一旦写岔，tests/test_fonts.py 会红。
+            font_path=_env_str("QSML_FONT_PATH"),
         )
 
     def merged(self, **overrides: Any) -> "Settings":

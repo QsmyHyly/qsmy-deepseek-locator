@@ -4,20 +4,37 @@
 越界值在绘制前会被**夹紧到边界**（而不是抛异常）—— 画在边上总好过整张图打不出来；
 但真正的判断（这是不是像素坐标）归 parsing.check_coordinate_range，本模块只负责画。
 
-中文字体是这里最容易被忽略的坑：硬编码 NotoSansCJK 在 Windows 上必然报错，
-所以按「Windows -> macOS -> Linux」顺序探测常见中文字体，全都找不到时退回 PIL 内置位图字体
-（英文标签仍可读，中文会变成方块，属于「能用但要提醒」的状态）。
+中文字体是这里最容易被忽略的坑，有两层：
+
+1. **按「字体名优先」探测，不是按目录顺序**：外循环是候选文件名、内循环才是目录
+   （见 _find_font_file）。所以决定命中谁的是**名字在 _FONT_CANDIDATES 里的位次**，
+   目录只决定它在哪。想加一台机器上的字体，优先把它加进候选名，而不是调目录顺序。
+2. **文件名不足以说明它含中文字形**。实测安卓上 /system/fonts/DroidSans.ttf 是
+   Roboto-Regular.ttf 的软链 —— 名字像中文字体，实际只有拉丁字形，拿它渲染中文
+   只会得到一片豆腐块。所以选定字体后要**真渲染一次做校验**（见 _renders_cjk），
+   校验不过就继续往后找。这一步要真的解码字体，代价换来的是「不会静默画方块」。
+
+全都找不到时退回 PIL 内置位图字体（英文标签仍可读，中文会变成方块），并**发一次告警**
+（见 _warn_no_cjk）—— 安卓上曾经因为这一步是静默的，图能正常出、只有标签是豆腐块，
+排查了很久才发现。要自己指定字体：resolve_font(size, font_path=...) 或环境变量
+QSML_FONT_PATH / QSML_FONT_DIR。
+
+@doc README.md#8-常见问题
+（该文档解决"中文标签变成方块了怎么办、字体路径怎么给"的问题。）
 """
 
 from __future__ import annotations
 
 import os
 import uuid
+import warnings
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 from PIL import Image, ImageColor, ImageDraw, ImageFont
 
+from .errors import OutputPathError, WriteError
 from .images import load_image
 from .parsing import Detection, parse_detections
 
@@ -29,18 +46,28 @@ COLORS: list[str] = list(dict.fromkeys([
     "olive", "coral", "lavender", "violet", "gold", "silver",
 ] + _EXTRA_COLORS))
 
-# 跨平台中文字体候选。顺序 = 命中概率，别把 Arial 之类不含中文的排前面。
+# 跨平台中文字体候选，顺序 = 命中概率（见模块头第 1 条：这是**名字优先**的排序）。
+# 开头的五条由安卓贡献：这个库最早只认桌面三大平台，安卓上必然探测失败，
+# 于是中文标签静默变成豆腐块 —— 而 /system/fonts/NotoSansCJK-Regular.ttc 其实老早
+# 就写在本列表里，**只差一个目录**（见 _FONT_DIRS）。别把不含中文的（Arial 之类）排前面。
 _FONT_CANDIDATES = [
-    "msyh.ttc", "msyhbd.ttc",            # Windows 微软雅黑
-    "simhei.ttf", "simsun.ttc",          # Windows 黑体 / 宋体
-    "NotoSansCJK-Regular.ttc",
+    "MiSans-Regular.ttf", "MiSansVF.ttf",     # 安卓 · 小米（VF 是可变字体，PIL 取默认实例）
+    "HarmonyOS_Sans_SC_Regular.ttf",          # 安卓 · 华为
+    "NotoSansCJK-Regular.ttc",                # 安卓 / Linux 通用（同文件含 SC/TC/JP/KR 多个 face）
     "NotoSansCJKsc-Regular.otf",
+    "DroidSansFallback.ttf", "DroidSansFallbackFull.ttf",   # 安卓老 ROM 的兜底中文字体
+    "msyh.ttc", "msyhbd.ttc",                 # Windows 微软雅黑
+    "simhei.ttf", "simsun.ttc",               # Windows 黑体 / 宋体
     "PingFang.ttc", "Hiragino Sans GB.ttc",   # macOS
     "wqy-microhei.ttc", "wqy-zenhei.ttc",     # Linux
-    "DejaVuSans.ttf", "Arial.ttf",
+    "DejaVuSans.ttf", "Arial.ttf",            # 兜底：不含中文，但至少是矢量字体
 ]
 
+# 探测目录。安卓两条放最前（移动端优先），其余是桌面平台的常规位置。
+# ⚠️ 目录顺序只在**候选名相同时**才起作用：命中哪个字体由 _FONT_CANDIDATES 的位次决定。
 _FONT_DIRS = [
+    Path("/system/fonts"),                # 安卓（绝大多数 ROM 的字体都在这）
+    Path("/product/fonts"),               # 部分 ROM 把字体放这里
     Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts",
     Path("/usr/share/fonts"),
     Path("/usr/local/share/fonts"),
@@ -49,38 +76,179 @@ _FONT_DIRS = [
     Path("/Library/Fonts"),
 ]
 
-_font_cache: dict[int, Any] = {}
+# 用户显式指定的字体路径（环境变量）。它的**权威性高于探测**：给了就用，即使探测
+# 能在别处找到中文字体。理由：能被这条路径影响的人，正是那些「这台机器上哪个字体能用
+# 只有我知道」的人（安卓 App、精简过的容器镜像）。
+FONT_PATH_ENV = "QSML_FONT_PATH"
+# 用户显式指定的字体目录（环境变量）。只影响**探测范围**，找到的字体仍要过渲染校验 ——
+# 它解决的是「字体在这台机器上，只是不在我知道的目录里」。
+FONT_DIR_ENV = "QSML_FONT_DIR"
+
+# 字体对象缓存：键是 (字体文件路径, 字号)。路径进键是必须的 —— 同一个进程里可能先用
+# 默认字体、再被显式指定成另一个文件（App 就是这么干的），只按字号缓存会串味。
+# 上限存在的意义：font_path 由调用方给，理论上可以给出很多个不同的值。
+_font_cache: dict[tuple[str, int], Any] = {}
+_FONT_CACHE_MAX = 32
+
+# 告警只发一次的开关。**刻意不做成"每次降级都发"**：draw 会按多个字号调用 resolve_font，
+# 一次打标就能刷出好几条同样的告警，反而把真正该看的那条埋掉。
+_warned_no_cjk = False
+
+
+@lru_cache(maxsize=64)
+def _renders_cjk(path: str) -> bool:
+    """真渲染一遍，判断这个字体文件有没有中文字形。
+
+    判据（来自安卓 App 的实测，见 drawing.py 模块头第 2 条）：把「中」与**肯定不存在**的
+    U+FFFF 各画一遍，逐像素比较 —— 两者位图完全相同，说明「中」也被当成了 .notdef（豆腐块）。
+
+    为什么要额外判一次墨迹量（>20 个亮像素）：「中」与 U+FFFF 不同**也可能**是因为该字体
+    给 .notdef 画了个带轮廓的空框，而中文根本没画出来。多这一条，是让判据偏保守 ——
+    宁可误判「这个字体不行」去试下一个，也不要误判「行」然后画出方块。
+
+    失败一律返回 False，不抛异常：它跑在探测路径上，探测失败的正确后果是「继续找下一个」。
+    """
+    try:
+        box = Image.new("L", (96, 48), 0)
+        painter = ImageDraw.Draw(box)
+        hit_font = ImageFont.truetype(path, 32)
+        painter.text((4, 4), "中", fill=255, font=hit_font)
+        hit = box.tobytes()
+        box2 = Image.new("L", (96, 48), 0)
+        ImageDraw.Draw(box2).text((4, 4), "\uffff", fill=255, font=hit_font)
+        miss = box2.tobytes()
+    except Exception:  # noqa: BLE001 - 探测路径，失败就当作「这个字体不行」
+        return False
+    return hit != miss and sum(1 for value in hit if value > 32) > 20
+
+
+def _load_truetype(path: str | None, size: int, *, verify: bool) -> Any | None:
+    """开字体文件；开了但**确认不含中文字形**时返回 None（表示"换一个试试"）。
+
+    verify=False 时跳过渲染校验，给两条路用：用户显式指定的字体（他的判断优先于我们的），
+    以及二次尝试（已经校验过一遍，同一文件不必再渲染）。
+
+    ⚠️ 注意「文件打不开」与「能打开但没中文」是两回事，返回值却都是 None：
+    前者说明路径本身不可用，调用方该退回内置字体；后者该继续往后找。区分它们的责任
+    在 resolve_font（它是唯一知道"还有没有下一个候选"的地方），这里只如实报告结果。
+    """
+    if not path:
+        return None
+    try:
+        font = ImageFont.truetype(path, size=size)
+    except Exception:  # noqa: BLE001 - 文件损坏 / 不是字体 / 权限不足
+        return None
+    if verify and not _renders_cjk(path):
+        return None
+    return font
+
+
+def _warn_no_cjk() -> None:
+    """找不到含中文字形的字体时告警一次（同一进程只吵一次）。
+
+    为什么必须说出来：降级到 load_default() 时**图还是能正常出**，只是中文标签变成方块。
+    这种「悄悄坏掉」在安卓上代价极大 —— 用户看到的是「定位成功、标签乱码」，
+    第一反应是模型不行或我们解析错了，而真实原因只是少了一个目录。宁可吵，不可静默。
+    """
+    global _warned_no_cjk
+    if _warned_no_cjk:
+        return
+    _warned_no_cjk = True
+    warnings.warn(
+        "没有找到含中文字形的字体文件，已退回 PIL 内置位图字体："
+        "英文标签可以正常显示，**中文标签会变成方块（豆腐块）**。\n"
+        "三种给法任选一种：\n"
+        "  1) resolve_font(22, font_path='/path/to/NotoSansCJK-Regular.ttc')；\n"
+        "  2) 环境变量 QSML_FONT_PATH=/path/to/字体文件；\n"
+        "  3) 环境变量 QSML_FONT_DIR=/path/to/字体目录（库会在里面按候选名找）。\n"
+        f"本机探测过的目录：{[str(p) for p in _FONT_DIRS]}",
+        UserWarning,
+        stacklevel=4,   # 指到调用 resolve_font 的那一行（draw -> resolve_font -> 这里）
+    )
 
 
 def _find_font_file() -> str | None:
+    """按「名字优先」找出一个**确认能渲染中文**的字体文件路径；找不到返回 None。
+
+    ⚠️ 这里返回的必须已经过 _renders_cjk 校验：只看文件名会踩到
+    /system/fonts/DroidSans.ttf（Roboto 的软链，名字像中文字体，实际只有拉丁字形）。
+    唯一的例外是开了 QSML_FONT_PATH —— 那是用户在明确说「就用这个」，不再由本函数替他判断。
+
+    目录来源：QSML_FONT_DIR 给了就只用它（用户明确限定了范围），否则用 _FONT_DIRS。
+    """
+    explicit = (os.environ.get(FONT_PATH_ENV) or "").strip()
+    if explicit and Path(explicit).exists():
+        return explicit
+
+    env_dir = (os.environ.get(FONT_DIR_ENV) or "").strip()
+    directories = [Path(env_dir)] if env_dir else _FONT_DIRS
+
     for name in _FONT_CANDIDATES:
-        for directory in _FONT_DIRS:
+        for directory in directories:
             candidate = directory / name
-            if candidate.exists():
+            if candidate.exists() and _renders_cjk(str(candidate)):
                 return str(candidate)
         # 有些发行版把字体放在子目录里，做一次浅层递归
-        for directory in _FONT_DIRS:
+        for directory in directories:
             if not directory.exists():
                 continue
             for found in directory.rglob(name):
-                return str(found)
+                if _renders_cjk(str(found)):
+                    return str(found)
     return None
 
 
-def resolve_font(size: int = 20) -> Any:
-    """取一个尽量支持中文的字体对象（按 size 缓存，避免每条标注都重开文件）。"""
-    if size in _font_cache:
-        return _font_cache[size]
+def resolve_font(size: int = 20, *, font_path: str | Path | None = None) -> Any:
+    """取一个尽量支持中文的字体对象（== 同一个字体文件 + 字号**只开一次文件**）。
+
+    字体文件的来源，优先级从高到低（前一个拿不到就试后一个）：
+
+        1. font_path 参数         —— 调用方当场指定，**不再做中文校验**（你的判断优先）
+        2. QSML_FONT_PATH         —— 环境变量指定，同上
+        3. QSML_FONT_DIR          —— 只限定探测目录，找到的字体仍要过 _renders_cjk
+        4. _FONT_DIRS 探测         —— 名字优先，命中后要过 _renders_cjk
+        5. PIL 内置位图字体         —— 兜底，此时**会发一次告警**（中文会变方块，见 _warn_no_cjk）
+
+    Args:
+        size: 字号（像素）。
+        font_path: 直接指定字体文件。给了就用它，连探测都不做 —— 这条路存在的意义是
+            「这台机器上哪个字体能用只有我知道」，典型场景是安卓 App（/system/fonts 下的
+            字体五花八门，还有 Roboto 软链冒充中文字体）。给一个打不开的路径不算错误，
+            会退回探测并最终告警。
+
+    Returns:
+        PIL 的字体对象（ImageFont.FreeTypeFont 或内置位图字体）。
+
+    为什么参数是 font_path 而不是 font 对象：缓存按 (路径, 字号) 做键才成立，
+    传对象进来的话「同一个字体换个字号」就得重新开文件，而打标路径上字号是常量、
+    字体文件却可能很大（NotoSansCJK 是 32MB，安卓上每次重开都是实打实的 IO）。
+    """
+    key = (str(font_path) if font_path else "", size)
+    if key in _font_cache:
+        return _font_cache[key]
+
+    if font_path:
+        font = _load_truetype(str(font_path), size, verify=False)
+        if font is not None:
+            return _remember(key, font)
+
     path = _find_font_file()
-    font: Any
     if path:
-        try:
-            font = ImageFont.truetype(path, size=size)
-        except Exception:  # noqa: BLE001 - 字体文件损坏时退回内置字体，不让打标失败
-            font = ImageFont.load_default()
-    else:
-        font = ImageFont.load_default()
-    _font_cache[size] = font
+        # verify=False：_find_font_file 只返回**已经过校验**的路径（或用户显式指定的），
+        # 这里再渲染一遍纯属白花 —— 但文件仍可能按这个字号打不开，所以仍要检查返回值。
+        font = _load_truetype(path, size, verify=False)
+        if font is not None:
+            return _remember(key, font)
+
+    _warn_no_cjk()
+    return _remember(key, ImageFont.load_default())
+
+
+def _remember(key: tuple[str, int], font: Any) -> Any:
+    """记录缓存（超过上限时清空，而不是做成 LRU —— 这里要的是"别再开文件"，不是命中率）。"""
+    if len(_font_cache) >= _FONT_CACHE_MAX:
+        _font_cache.clear()
+    _font_cache[key] = font
     return font
 
 
@@ -275,6 +443,7 @@ def draw(
     draw_label: bool = True,
     colors: Sequence[str] | None = None,
     scale_to_image: bool = False,
+    font_path: str | Path | None = None,
 ) -> Image.Image:
     """在图片上画出 Detection（框 / 点 + 标签），返回新图（不改动入参图）。
 
@@ -288,6 +457,9 @@ def draw(
             3px 的框线画在 4000px 宽的图上细得几乎看不见，22px 的标签同理。
             默认 False —— 它改的是观感而不是正确性，不该悄悄改掉已有调用方的输出。
         draw_label: 关掉可得到只有框、没有文字的干净标注图。
+        font_path: 指定中文字体文件（默认自动探测）。字体探测失败时中文标签会变方块，
+            所以「我知道这台机器上哪个字体能用」的场景就该显式传它，别让库去猜 ——
+            see resolve_font 的优先级列表。
 
     Returns:
         画好的新图（RGB）。标签默认画在框上方；贴图片边缘时会翻到框内侧、被别的标签
@@ -309,7 +481,7 @@ def draw(
     point_radius = auto_radius if point_radius is None else point_radius
 
     painter = ImageDraw.Draw(img)
-    font = resolve_font(font_size)
+    font = resolve_font(font_size, font_path=font_path)
     # 已经画出去的标签矩形，用来给后面的标签让位（见 _label_rect 第 2 步）
     placed: list[tuple[int, int, int, int]] = []
 
@@ -365,14 +537,19 @@ def save_annotated(
     Args:
         path: 直接给完整文件路径（优先）。扩展名决定保存格式
             （.png/.jpg/.jpeg/.webp/.bmp/.tif/.tiff/.gif），不写扩展名补 .png，
-            认不出的扩展名抛 ValueError —— 理由见 resolve_output_path。
+            认不出的扩展名抛 OutputPathError（也是 ValueError）—— 理由见 resolve_output_path。
         output_dir / stem: 不给 path 时用它们拼；两者都缺省则落在当前工作目录，
             文件名 annotated_<12位hex>.png。
+
+    Raises:
+        OutputPathError: 路径本身不可用（空、后缀不认识、父目录是个文件……）。
+        WriteError: 路径没问题但写不动（磁盘满、只读挂载、没有写权限），
+            原始 OSError 在 __cause__ 上。两者都是 LocatorError，一把兜得住。
     """
     annotated = draw(image, items, **draw_kwargs)
     if path is None:
         directory = Path(output_dir) if output_dir else Path.cwd()
-        directory.mkdir(parents=True, exist_ok=True)
+        _prepare_dir(directory)
         name = stem or f"annotated_{uuid.uuid4().hex[:12]}"
         path = directory / f"{name}.png"
     # 走 resolve_output_path，而不是写死 format="PNG"：本函数是公开 API，
@@ -380,9 +557,36 @@ def save_annotated(
     # 的图 —— 正是下面 _OUTPUT_FORMATS 注释里点名的那类最难排查的问题。
     # CLI 的 -o 与 Locator.locate_and_draw 都走这里，所以这一处同时修好三条路径。
     target, fmt = resolve_output_path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    annotated.save(target, format=fmt)
+    _prepare_dir(target.parent)
+    try:
+        annotated.save(target, format=fmt)
+    except (OSError, ValueError) as exc:
+        # 落盘是**最后一步**，崩在这里意味着前面那次 API 调用已经花掉了。
+        # 所以这里必须把话说全：哪个路径、什么原因、先前有没有成功。
+        # 0.1.2 及以前这一行是裸的 annotated.save()，抛出去的是原生 OSError /
+        # ValueError（PIL 认不出格式时），只写 except LocatorError 的调用方直接漏网。
+        raise WriteError(
+            f"标注图写入失败：{target}（{type(exc).__name__}: {exc}）\n"
+            "识别已经完成，只是图没落盘；换个可写目录或用绝对路径重试即可，不必再调一次模型。"
+        ) from exc
     return target
+
+
+def _prepare_dir(directory: Path) -> None:
+    """建出输出目录，失败时把 OSError 转成 LocatorError（而不是让它裸奔）。
+
+    这是「输出位置」问题的唯一一处兜底，被 save_annotated 和 Locator.locate_to_file 共用 ——
+    P2-1 反馈的正是「默认输出位置相对 CWD，安卓上 CWD 是 / 或不可写，于是直接失败」，
+    失败可以，但要失败得看得懂：报错里必须带上**具体路径**。
+    """
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise WriteError(
+            f"输出目录无法使用：{directory}（{type(exc).__name__}: {exc}）\n"
+            "常见原因：路径不可写 / 是个文件而不是目录 / 相对路径的解析基准（CWD）不对。"
+            "移动端或服务端请直接传绝对路径。"
+        ) from exc
 
 
 # 标注图输出支持的扩展名 -> PIL 保存格式。
@@ -405,12 +609,13 @@ def resolve_output_path(output: str | Path | None) -> tuple[Path, str]:
 
     - 带支持的扩展名（.png/.jpg/.jpeg/.webp/.bmp/.tif/.tiff/.gif）-> 用对应格式保存；
     - 没写扩展名 -> 补 .png（画出来的默认就是 PNG），所以 output="out" 与 "out.png" 同义；
-    - 空路径 / 认不出的扩展名 -> ValueError，绝不偷偷换成别的格式。
+    - 空路径 / 认不出的扩展名 -> OutputPathError（同时是 ValueError 与 LocatorError），
+      绝不偷偷换成别的格式。
 
     大小写不敏感（.PNG 与 .png 等价，保存时显式给 format，不靠 PIL 猜后缀）。
     """
     if output is None or not str(output).strip():
-        raise ValueError("必须给标注图的输出路径（含文件名），例如 output='runs/out.png'")
+        raise OutputPathError("必须给标注图的输出路径（含文件名），例如 output='runs/out.png'")
     path = Path(str(output))
     suffix = path.suffix.lower()
     if not suffix:
@@ -418,7 +623,7 @@ def resolve_output_path(output: str | Path | None) -> tuple[Path, str]:
         suffix = ".png"
     fmt = _OUTPUT_FORMATS.get(suffix)
     if fmt is None:
-        raise ValueError(
+        raise OutputPathError(
             f"输出路径的扩展名 {suffix!r} 不支持：{path}\n"
             f"支持 {'/'.join(sorted(_OUTPUT_FORMATS))}；不写扩展名则默认存成 .png。"
         )
@@ -432,4 +637,8 @@ __all__ = [
     "resolve_font",
     "resolve_output_path",
     "COLORS",
+    # 字体探测的两个环境变量名，做成常量导出：
+    # 调用方（尤其是打包脚本 / App 侧）能 import 到，就不必再手抄字符串。
+    "FONT_PATH_ENV",
+    "FONT_DIR_ENV",
 ]
