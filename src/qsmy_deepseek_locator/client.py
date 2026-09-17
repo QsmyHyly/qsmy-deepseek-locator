@@ -36,6 +36,17 @@
 
 @doc docs/API-NOTES.md#6-流式必须同时读-reasoning_content
 （该文档解决"流式 chunk 长什么样、为什么不能只读 delta.content"的问题。）
+
+拆分后的职责与边界（0.1.2 -> 0.1.3 的等价重构，行为零变化）：
+    本模块只剩**客户端本身** —— ChatReply / VisionClient 协议 / DeepSeekVisionClient，
+    外加两条错误措辞（_empty_hint / _format_api_error）。
+    拼报文那批纯函数（image_part / thinking_payload / resolve_thinking / build_messages /
+    build_request，原本在本文件第 100-201 行）搬到了 request_build.py；
+    chunk 到事件的解包（_tool_call_events / _accumulate_tool_calls / _stream_events /
+    _events_from_chunk / _events_from_completion / _usage_dict，原本在第 444-591 行）
+    搬到了 stream_events.py。
+    两者都在下面 import 回来，所以 from .client import build_request 这类老路径
+    （含 App 项目 vendor 的镜像）照旧可用 —— **client.py 仍然是对外那一个门面**。
 """
 
 from __future__ import annotations
@@ -43,9 +54,35 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterator, Protocol
 
-from .config import REASONING_EFFORTS, IMAGE_DETAILS, Settings, redacted
+# IMAGE_DETAILS / REASONING_EFFORTS 在拆分前就随「拼报文」那批一起从这里可见，
+# 保留它们是为了不改动任何一个旧 import 路径（谁在用没法从本仓库看出来）。
+from .config import IMAGE_DETAILS, REASONING_EFFORTS, Settings, redacted
 from .debuglog import DebugLog
 from .errors import APIError, EmptyResponseError, LocatorError
+
+# --------------------------------------------------------------------------- #
+# 拆分出去、但继续从本模块对外暴露的名字（老 import 路径的兼容层）
+#
+# 这些名字在拆分前就定义在 client.py 里：拼报文的一批是纯函数（便于单测直接断言），
+# 解包的一批是下划线开头的内部件（自测也直接 import 它们喂假 chunk）。
+# 实现搬走了，名字留在这里 —— 少动一处 import，就少一个镜像漂移的机会。
+# --------------------------------------------------------------------------- #
+from .request_build import (
+    build_messages,
+    build_request,
+    image_part,
+    resolve_thinking,
+    thinking_payload,
+)
+from .stream_events import (
+    _accumulate_tool_calls,
+    _events_from_chunk,
+    _events_from_completion,
+    _stream_events,
+    _tool_call_events,
+    _usage_dict,
+)
+
 
 # 事件回调签名：六种事件，字段见 DeepSeekVisionClient.stream() 的 docstring。
 #   reasoning / content  模型在想什么、写了什么（片段）
@@ -94,116 +131,6 @@ class VisionClient(Protocol):
     # 这样自备客户端、自己实现了本协议的老代码，不用日志功能时完全不受影响。
 
 
-# --------------------------------------------------------------------------- #
-# 报文拼装（纯函数，便于单测直接断言，不必联网）
-# --------------------------------------------------------------------------- #
-def image_part(url: str, detail: str | None = None) -> dict:
-    """构造一个 image_url 内容块。
-
-    detail 只接受 low / high / original / auto；空值或不认识的值一律**不带该字段**。
-    非法值不抛异常是刻意的：它在「拼一次识别请求」的主路径上，为它抛异常会让整轮识别挂掉，
-    而写错一个 detail 最多只是「没生效」。要严格校验的地方是配置层。
-    """
-    payload: dict[str, Any] = {"url": url}
-    if detail and detail in IMAGE_DETAILS:
-        payload["detail"] = detail
-    return {"type": "image_url", "image_url": payload}
-
-
-def thinking_payload(enabled: bool | None) -> dict | None:
-    """构造 thinking 开关；None 表示**不发送该字段**（由服务端按默认处理，当前默认开启）。"""
-    if enabled is None:
-        return None
-    return {"thinking": {"type": "enabled" if enabled else "disabled"}}
-
-
-def resolve_thinking(
-    settings: Settings, thinking: bool | None, reasoning_effort: str | None = None
-) -> tuple[bool | None, str | None]:
-    """合并「按次覆盖」与「配置默认」，得到最终生效的 (thinking, effort)。
-
-    规则：
-    - thinking 为 None 且配置也没给 -> (None, None)，即两样都不传，服务端自己决定；
-    - 显式关闭思考 -> (False, None)，此时 effort 无意义，直接丢掉；
-    - 开启思考时 effort 必须在白名单内，非法值一律不传（宁可走服务端默认，也不要 400）。
-    """
-    enabled = settings.thinking if thinking is None else bool(thinking)
-    if enabled is False:
-        return False, None
-    effort = (settings.reasoning_effort if reasoning_effort is None else reasoning_effort) or ""
-    effort = effort.strip().lower()
-    effort = effort if effort in REASONING_EFFORTS else None
-    return enabled, effort
-
-
-def build_messages(
-    prompt: str,
-    *,
-    image_url: str | None = None,
-    system_prompt: str | None = None,
-    image_detail: str | None = None,
-) -> list[dict]:
-    """拼 system + user 两条消息；有图时 user 用内容块数组（图片只能在 user 消息里）。
-
-    ⚠️ 官方明确：图片放在 system / assistant 消息里会 400，别乱挪。
-    """
-    messages: list[dict] = []
-    if system_prompt:
-        messages.append({"role": "system", "content": system_prompt})
-    if image_url:
-        messages.append({
-            "role": "user",
-            "content": [
-                image_part(image_url, image_detail),
-                {"type": "text", "text": prompt},
-            ],
-        })
-    else:
-        messages.append({"role": "user", "content": prompt})
-    return messages
-
-
-def build_request(
-    settings: Settings,
-    messages: list[dict],
-    *,
-    stream: bool = True,
-    tools: list[dict] | None = None,
-    tool_choice: str | dict | None = None,
-) -> dict:
-    """拼出 chat.completions.create 的关键字参数（不含客户端本身）。
-
-    单独抽出来是为了让自测能直接断言「报文长什么样」，不用打桩整个 SDK。
-
-    tools / tool_choice 是**原样透传**给服务端的：本库不校验工具 schema，
-    也不替你执行工具（那是调用方的事，见 stream() 的 docstring）。传了才会带上这两个字段。
-    """
-    enabled, effort = resolve_thinking(settings, None, None)
-    kwargs: dict[str, Any] = {
-        "model": settings.model,
-        "messages": messages,
-        "stream": stream,
-    }
-    if tools:
-        kwargs["tools"] = tools
-    if tool_choice:
-        kwargs["tool_choice"] = tool_choice
-    extra = thinking_payload(enabled)
-    if extra is not None:
-        kwargs["extra_body"] = extra
-    if effort:
-        kwargs["reasoning_effort"] = effort
-    if settings.max_tokens:
-        kwargs["max_tokens"] = settings.max_tokens
-    if stream:
-        # usage 只在显式要求时才随最后一个 chunk 回来；拿不到就是 None，不影响主流程。
-        kwargs["stream_options"] = {"include_usage": True}
-    return kwargs
-
-
-# --------------------------------------------------------------------------- #
-# 真实客户端
-# --------------------------------------------------------------------------- #
 class DeepSeekVisionClient:
     """基于 openai SDK 的 DeepSeek 客户端（OpenAI 兼容协议）。
 
@@ -439,156 +366,6 @@ def _format_api_error(exc: Exception, settings: Settings) -> str:
     if status:
         head += f"（HTTP {status}）"
     return f"{head}{detail}（原始异常：{type(exc).__name__}: {exc}）"
-
-
-def _tool_call_events(tool_calls: Any) -> Iterator[dict]:
-    """把 tool_calls 拆成 {"type": "tool_call", ...} 事件。
-
-    ⚠️ 流式下的工具调用是**逐字符**吐的（实测 deepseek-flash 会把 `{"city": "北京"}`
-    拆成十几个 chunk，一个 chunk 一个字符；换成本库那个 crop_region 工具则是 47 个分片）：
-    第一个分片带 id 与函数名，之后每个分片只带 arguments 的一小段，
-    最后一个分片同时带 finish_reason="tool_calls"。
-    所以事件里的 arguments 是**增量**，要拿到完整参数得自己按 index 拼
-    —— complete() 里的 _accumulate_tool_calls 干的就是这件事。
-
-    @doc docs/API-NOTES.md#61-工具调用也是流式的而且一个字符一个-chunk
-    （该文档解决"分片的字段为什么后面会变 null、finish_reason 为什么是 tool_calls"的问题。）
-
-    非流式响应走的是同一个函数：那时 arguments 已经是完整串、index 是 None，
-    这里用列表下标补上，于是两条路径的累积逻辑可以完全一样。
-    """
-    if not tool_calls:
-        return
-    for position, call in enumerate(tool_calls):
-        index = getattr(call, "index", None)
-        call_id = getattr(call, "id", None)
-        function = getattr(call, "function", None)
-        name = getattr(function, "name", None) if function is not None else None
-        arguments = getattr(function, "arguments", None) if function is not None else None
-        if call_id is None and name is None and not arguments:
-            continue  # 全空占位分片（有些服务会发），不发事件
-        yield {
-            "type": "tool_call",
-            "index": position if index is None else index,
-            "id": call_id,
-            "name": name,
-            "arguments": arguments or "",
-        }
-
-
-def _accumulate_tool_calls(acc: dict[int, dict], event: dict) -> None:
-    """把 tool_call 事件按 index 拼成完整的工具调用对象（原地修改 acc）。
-
-    合并规则：id / name 只在第一次出现时记下（后面对应字段是 null，别用 null 覆盖掉），
-    arguments 一律**追加**。
-    """
-    index = event.get("index", 0)
-    slot = acc.setdefault(index, {
-        "id": None,
-        "type": "function",
-        "function": {"name": None, "arguments": ""},
-    })
-    if event.get("id"):
-        slot["id"] = event["id"]
-    if event.get("name"):
-        slot["function"]["name"] = event["name"]
-    slot["function"]["arguments"] += event.get("arguments") or ""
-
-
-def _stream_events(chunks: Any, log: DebugLog | None) -> Iterator[dict]:
-    """把 chunk 流拆成事件，并顺手（可选）把**原始 chunk** 也记进日志。
-
-    model 去重放在这里：服务端在**每一个** chunk 上都带 model 字段，照单全收的话
-    一次调用会甩出上百条一模一样的 model 事件，把 on_event 刷屏
-    （第一次跑 examples/stream_events.py 就是这么发现的）。模型名不会中途改变，
-    因此只在第一次出现时发一条。
-    """
-    last_model: str | None = None
-    for chunk in chunks:
-        if log is not None and log.chunks:
-            log.write("chunk", chunk)
-        for event in _events_from_chunk(chunk):
-            if event.get("type") == "model":
-                if event.get("model") == last_model:
-                    continue
-                last_model = event.get("model")
-            yield event
-
-
-def _events_from_chunk(chunk: Any) -> Iterator[dict]:
-    """把一个流式 chunk 拆成事件。
-
-    注意 chunk.choices 可能为空数组：开了 include_usage 时，最后一个只带 usage 的
-    chunk 就是这个形状，直接取 choices[0] 会 IndexError。
-    """
-    usage = getattr(chunk, "usage", None)
-    if usage is not None:
-        yield {"type": "usage", "usage": _usage_dict(usage)}
-    model = getattr(chunk, "model", None)
-    if model:
-        yield {"type": "model", "model": model}
-
-    choices = getattr(chunk, "choices", None) or []
-    if not choices:
-        return
-    choice = choices[0]
-    delta = getattr(choice, "delta", None)
-
-    reasoning = getattr(delta, "reasoning_content", None) if delta is not None else None
-    if reasoning:
-        yield {"type": "reasoning", "text": reasoning}
-
-    content = getattr(delta, "content", None) if delta is not None else None
-    if content:
-        yield {"type": "content", "text": content}
-
-    tool_calls = getattr(delta, "tool_calls", None) if delta is not None else None
-    yield from _tool_call_events(tool_calls)
-
-    finish = getattr(choice, "finish_reason", None)
-    if finish:
-        yield {"type": "finish", "reason": finish}
-
-
-def _events_from_completion(completion: Any) -> Iterator[dict]:
-    """非流式响应拆成同样的事件（保留非流式入口，方便对接只支持非流的代理）。"""
-    usage = getattr(completion, "usage", None)
-    if usage is not None:
-        yield {"type": "usage", "usage": _usage_dict(usage)}
-    model = getattr(completion, "model", None)
-    if model:
-        yield {"type": "model", "model": model}
-    choices = getattr(completion, "choices", None) or []
-    if not choices:
-        return
-    message = getattr(choices[0], "message", None)
-    reasoning = getattr(message, "reasoning_content", None) if message is not None else None
-    if reasoning:
-        yield {"type": "reasoning", "text": reasoning}
-    content = getattr(message, "content", None) if message is not None else None
-    if content:
-        yield {"type": "content", "text": content}
-    tool_calls = getattr(message, "tool_calls", None) if message is not None else None
-    yield from _tool_call_events(tool_calls)
-    finish = getattr(choices[0], "finish_reason", None)
-    if finish:
-        yield {"type": "finish", "reason": finish}
-
-
-def _usage_dict(usage: Any) -> dict:
-    """把 SDK 的 usage 对象转成普通 dict（不同版本字段名不完全一样，能取多少取多少）。"""
-    if isinstance(usage, dict):
-        return dict(usage)
-    out: dict[str, Any] = {}
-    for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
-        value = getattr(usage, key, None)
-        if value is not None:
-            out[key] = value
-    details = getattr(usage, "completion_tokens_details", None)
-    reasoning_tokens = getattr(details, "reasoning_tokens", None) if details is not None else None
-    if reasoning_tokens is not None:
-        out["reasoning_tokens"] = reasoning_tokens
-    return out
 
 
 __all__ = [

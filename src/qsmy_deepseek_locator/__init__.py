@@ -76,10 +76,20 @@ from .parsing import (
 )
 from .prompts import DEFAULT_SYSTEM_PROMPT, DEFAULT_USER_PROMPT, build_user_prompt
 
+# 版本号有两个来源，必须一起改：
+#   装了包 -> importlib.metadata 从 dist-info 读（真来源是 pyproject.toml 的 [project] version）；
+#   没装包 -> 下面这个兜底字面量。**从源码 import 的情形比想象中常见**：直接跑仓库里的脚本、
+#   或者像 App 项目那样把源码 vendor 进去，二者都拿不到 metadata，只能走兜底。
+#   顺带一提：src/ 下若留着上次构建的 egg-info（.gitignore 里那类残留），metadata 会先读到它，
+#   于是 __version__ 报到上一版去 —— 那种情况请删掉/重建 egg-info，不是这里的兜底出了问题。
+# 0.1.2 发版时就漏改了兜底值，于是那些人看到的 __version__ 是谎报的 0.1.1 ——
+# 而这恰恰是最需要版本号准确的时候（排查现场第一句话就是「你用的哪个版本」）。
+# 「发版时记得改」已经被证明靠不住了，所以 tests/test_version.py 会把兜底值与
+# pyproject.toml 的 version 钉在一起：只改一处，测试就红。
 try:  # 版本号只有一个来源：pyproject.toml
     __version__ = _version("qsmy-deepseek-locator")
 except PackageNotFoundError:  # 未安装（直接从源码 import）时的兜底
-    __version__ = "0.1.1"
+    __version__ = "0.1.2"
 
 __all__ = [
     # 核心
