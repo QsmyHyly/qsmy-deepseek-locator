@@ -163,6 +163,41 @@ class TestRenderVerification:
 
 
 
+class TestFindCjkFont:
+    """公开的 find_cjk_font()：调用方要能问出「这台机器上会用哪个中文字体」。
+
+    加它的直接理由来自使用方（安卓 App 的设置页要显示当前字体）。这几个断言盯的是
+    **它和 resolve_font 别各查各的**：分开实现之后悄悄分叉，是这类"只读查询"最常见的退化。
+    """
+
+    def test_exposed_on_the_package(self):
+        # 必须是包级公开面，不能只是绘图模块的私有细节：
+        # 使用方写的 from qsmy_deepseek_locator import find_cjk_font 才是稳定契约。
+        import qsmy_deepseek_locator as pkg
+
+        assert "find_cjk_font" in pkg.__all__
+        assert pkg.find_cjk_font is drawing.find_cjk_font
+
+    def test_says_the_font_resolve_font_actually_uses(self, cjk_font):
+        # 本函数说"会用这个"，resolve_font 就得**真的**用它 —— 两个函数分头实现的话，
+        # 这一条会立刻红。
+        assert drawing.find_cjk_font() == cjk_font
+        assert getattr(resolve_font(20), "path", None) == cjk_font
+
+    def test_none_when_there_is_really_nothing(self, monkeypatch, tmp_path):
+        # 负向对照：找不到时必须是 None（不是空串、不是抛异常）。
+        # 没有这一条的话，"永远返回某个路径"的实现也能过上面两条。
+        _silence_cjk_search(monkeypatch, tmp_path)
+        assert drawing.find_cjk_font() is None
+
+    def test_env_font_path_is_returned_verbatim(self, cjk_font, monkeypatch):
+        # QSML_FONT_PATH 优先于探测，且**不做中文校验**（用户判断优先）。
+        # 把这条写死，是为了让"以后给 QSML_FONT_PATH 也加上校验"必须显式推翻一条断言，
+        # 而不是悄悄改掉行为 —— 使用方正是靠"我说用哪个就用哪个"来兜底的。
+        monkeypatch.setenv(drawing.FONT_PATH_ENV, cjk_font)
+        assert drawing.find_cjk_font() == cjk_font
+
+
 class TestResolveFontInjection:
     """P1-1：调用方要有正式途径指定字体，而不是 monkeypatch 私有函数。"""
 

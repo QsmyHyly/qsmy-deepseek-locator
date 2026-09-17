@@ -227,6 +227,30 @@ def _find_font_file() -> str | None:
     return None
 
 
+def find_cjk_font() -> str | None:
+    """本机会用的中文字体文件路径；一个都找不到返回 None。
+
+    公开面，回答「这台机器上到底有没有能画中文的字体、是哪一个」。要它的直接理由来自
+    使用方：安卓 App 的设置页要把「中文字体: /system/fonts/MiSans-Regular.ttf」显示出来，
+    或者显示「没找到中文字体，标签会变方块」—— 没有这个函数，调用方只能去够
+    _find_font_file() 这个私有名，或者干脆自己再抄一份探测逻辑（那个 App 原先就是抄的，
+    那正是重复的来源；它现在改用本函数了）。
+
+    探测优先级与 resolve_font 一致：
+    QSML_FONT_PATH > QSML_FONT_DIR 里的候选 > _FONT_DIRS 里的候选。
+    除 QSML_FONT_PATH 外，返回的路径**都过了真渲染校验**（详见 _find_font_file）——
+    只看文件名会把 /system/fonts/DroidSans.ttf（Roboto 的软链，只有拉丁字形）当成中文字体。
+
+    返回 None 不等于「这台机器画不出中文」：调用方仍可以用 font_path= 自己指定一个本函数
+    不认识的字体，那种情况下本库不校验（用户判断优先）。想知道**实际生效的那一个**
+    （可能已被 font_path 覆盖），请用 resolve_font(size) 再看它的 .path。
+
+    @doc README.md#8-常见问题
+    （该文档解决"找不到中文字体时标签为什么是方块、指定字体有哪几种方式"的问题。）
+    """
+    return _find_font_file()
+
+
 def resolve_font(size: int = 20, *, font_path: str | Path | None = None) -> Any:
     """取一个尽量支持中文的字体对象（== 同一个字体文件 + 字号**只开一次文件**）。
 
