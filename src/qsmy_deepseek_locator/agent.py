@@ -35,7 +35,7 @@ from typing import Any, Iterator
 
 from .client import DeepSeekVisionClient
 from .config import Settings
-from .parsing import decode_json_points, to_dict_items
+from .parsing import decode_json_points, to_items
 from .request_build import build_messages, merge_thinking
 from .tools import ToolRegistry, build_default_registry
 
@@ -246,7 +246,10 @@ def collect_items(events: list[dict], final_text: str = "") -> list[dict]:
             data = json.loads(event.get("content") or "")
         except Exception:  # noqa: BLE001 - 工具结果不一定是 JSON，跳过即可
             continue
-        got = [d for d in to_dict_items(data) if "bbox_2d" in d or "point_2d" in d]
+        # 必须用 to_items 而不是 to_dict_items：模型常把坐标交给 parse_coordinates
+        # 去处理，而那个工具的返回值是「成对列表」，里面没有 dict —— 用严格的
+        # to_dict_items 会静默得到空列表（见 parsing.to_items 的 docstring）。
+        got = [d for d in to_items(data) if "bbox_2d" in d or "point_2d" in d]
         if got:
             return got
     return []

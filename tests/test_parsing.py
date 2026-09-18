@@ -13,6 +13,7 @@ from qsmy_deepseek_locator.parsing import (
     normalize_to_unit,
     parse_detections,
     to_dict_items,
+    to_items,
 )
 
 
@@ -159,3 +160,59 @@ class TestDetection:
 
     def test_box_iou_reversed_edges(self):
         assert box_iou([0.5, 0.5, 0.0, 0.0], [0.0, 0.0, 0.5, 0.5]) == pytest.approx(1.0)
+
+class TestToItems:
+    """to_items / to_dict_items 的分工：谁认「工具返回的成对列表」。
+
+    这一组是**回归测试**，盯的是 2026-09-18 上游化时漏掉的那条分支：
+    agent.collect_items 当时改调严格的 to_dict_items，而它要读的
+    parse_coordinates 工具结果是成对列表（里面一个 dict 都没有），
+    于是工具模式下永远收集不到坐标。见 parsing.to_items 的 docstring。
+    """
+
+    # parse_coordinates 工具的真实返回形态（序列化成 JSON 之后）
+    PAIRED_JSON = '[[[0.18, 0.24, 0.43, 0.62]], ["bbox_1"], [], []]'
+
+    def test_dict_items_drops_the_paired_form(self):
+        # 负向对照的另一半：**故意**用严格的 to_dict_items，它必须丢掉 ——
+        # 这一条说明「换回 to_dict_items 就会重新踩坑」，而不是在描述 to_items 有多好。
+        assert to_dict_items(self.PAIRED_JSON) == []
+
+    def test_paired_json_becomes_items(self):
+        got = to_items(self.PAIRED_JSON)
+        assert got == [{"bbox_2d": [0.18, 0.24, 0.43, 0.62], "label": "bbox_1"}]
+
+    def test_paired_tuple_keeps_points_too(self):
+        got = to_items(([[0.1, 0.2, 0.3, 0.4]], ["框"], [[0.5, 0.6]], ["点"]))
+        assert got == [
+            {"bbox_2d": [0.1, 0.2, 0.3, 0.4], "label": "框"},
+            {"point_2d": [0.5, 0.6], "label": "点"},
+        ]
+
+    def test_paired_dict_keys(self):
+        got = to_items({"bboxes": [[0.1, 0.2, 0.3, 0.4]], "bbox_labels": ["框"],
+                        "points": [], "point_labels": []})
+        assert got == [{"bbox_2d": [0.1, 0.2, 0.3, 0.4], "label": "框"}]
+
+    def test_four_dicts_are_not_mistaken_for_a_quadruple(self):
+        # 四元组判定要求「元素全是列表」。正好 4 个 dict 的合法坐标列表
+        # 不能被它抢走 —— 否则最常见的输入反而会被拆坏（这类边界最容易漏）。
+        four = [{"bbox_2d": [0.0, 0.0, 0.1, 0.1], "label": str(i)} for i in range(4)]
+        assert to_items(four) == four
+        assert to_items(four) == to_dict_items(four)
+
+    def test_missing_labels_do_not_drop_the_coordinates(self):
+        # 工具只回坐标不回标签时，坐标要留着（整批丢掉的表现是
+        # 「模型明明答了、界面上什么都没有」，与「模型没答」长得一模一样）。
+        got = to_items(([[0.1, 0.2, 0.3, 0.4]], [], [], []))
+        assert got == [{"bbox_2d": [0.1, 0.2, 0.3, 0.4], "label": None}]
+
+    def test_plain_dict_and_garbage_still_behave(self):
+        # 与 to_dict_items 相同的那些档不能因为新分支而退化
+        one = {"bbox_2d": [0.0, 0.0, 1.0, 1.0], "label": "整图"}
+        assert to_items(one) == [one]
+        assert to_items([{"items": [one]}]) == [one] or to_items(one) == [one]
+        assert to_items("完全不是坐标的一段话") == []
+        assert to_items(None) == []
+        assert to_items(42) == []
+

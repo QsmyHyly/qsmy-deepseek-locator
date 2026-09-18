@@ -212,7 +212,12 @@ def parse_coordinates(text: Annotated[str, "包含坐标 JSON 的文本，可带
     return extract_coordinates(decode_json_points(text))
 
 def to_dict_items(data: Any) -> list[dict]:
-    """把解析结果统一成「坐标对象列表」（只保留 dict，其余丢弃）。"""
+    """把解析结果统一成「坐标对象列表」（**只保留 dict，其余丢弃**）。
+
+    ⚠️ 要读「工具返回值」时请用 `to_items()`，不是这个。本函数刻意严格：
+    它只认坐标对象本身，别的形状一律丢弃 —— 而工具返回的是**成对列表**，
+    里面一个 dict 都没有，走这里会静默得到空列表。两者的分工见 to_items 的 docstring。
+    """
     if isinstance(data, str):
         data = decode_json_points(data)
     if isinstance(data, dict):
@@ -225,6 +230,72 @@ def to_dict_items(data: Any) -> list[dict]:
     if isinstance(data, (list, tuple)):
         return [d for d in data if isinstance(d, dict)]
     return []
+
+
+# 工具返回值那一套「成对列表」的键名。工具的返回形态是跟着
+# tools.builtin.parse_coordinates / extract_coordinates 的签名走的，
+# 改那两个函数的返回值就要同步改这里。
+_PAIRED_KEYS = ("bboxes", "bbox_labels", "points", "point_labels")
+
+
+def _merge_paired(bboxes, bbox_labels, points, point_labels) -> list[dict]:
+    """把「坐标列表 + 标签列表」拼成坐标对象列表。
+
+    标签缺位时按 None 补，**不按短的那个截断**：工具偶尔只回坐标不回标签，
+    那时候该留下坐标。整批丢掉的表现是「模型明明答了，界面上什么都没有」，
+    这种"什么都没有"最难查——它和"模型没答"长得一模一样。
+    """
+    merged: list[dict] = []
+    bbox_labels = list(bbox_labels or [])
+    point_labels = list(point_labels or [])
+    for index, coord in enumerate(bboxes or []):
+        merged.append({BBOX_FIELD: coord, "label": bbox_labels[index] if index < len(bbox_labels) else None})
+    for index, coord in enumerate(points or []):
+        merged.append({POINT_FIELD: coord, "label": point_labels[index] if index < len(point_labels) else None})
+    return merged
+
+
+def to_items(text_or_data: Any) -> list[dict]:
+    """把**任意坐标来源**统一成坐标对象列表：[{"bbox_2d": [...], "label": ...}, ...]。
+
+    与 to_dict_items 的分工（**别用错，这个错真出过**）：
+
+    | | 认什么 | 谁该用 |
+    |---|---|---|
+    | `to_dict_items` | 只认坐标对象（dict / dict 列表），其余丢弃 | 要「用户写了几个对象」这种严格计数时 |
+    | `to_items` | 上面那些 **+ 成对列表**（工具返回的那套） | 要读**工具返回值**、要兼容多种入口时 |
+
+    "成对列表"指 `(bboxes, bbox_labels, points, point_labels)` 四元组 ——
+    本库的 `tools.builtin.parse_coordinates` / `extract_coordinates` 就是返回它，
+    序列化成 JSON 长这样：`[[[0.18,0.24,0.43,0.62]], ["bbox_1"], [], []]`。
+    **这种形状里一个 dict 都没有**，所以走 to_dict_items 会得到空列表。
+
+    为什么必须有它（2026-09-18 的真 bug）：`agent.collect_items()` 当时调的是
+    to_dict_items，可它要读的正是 `parse_coordinates` 的工具结果 ——
+    于是**工具模式下永远收集不到坐标**：SSE 里没有 annotated 事件、也不写历史记录，
+    而模型其实答得好好的。两个名字长得像、语义不同，是这次漏掉的直接原因
+    （那份正确的宽松实现当时只活在演示仓库里，没跟着上游化进来）。
+
+    支持输入：
+    - 文本：先经 `decode_json_points` 解析；
+    - 四元组 / 元素全是列表的四元素列表（`extract_coordinates` 的返回）；
+    - `{"bboxes":…, "bbox_labels":…, "points":…, "point_labels":…}` 字典；
+    - 单个坐标对象 / 坐标对象列表（这一档与 to_dict_items 相同）。
+    """
+    data = decode_json_points(text_or_data) if isinstance(text_or_data, str) else text_or_data
+
+    # 四元组判定必须在「坐标对象列表」之前，否则会被当成普通列表逐个丢。
+    # 要求元素**全是列表**，正是为了不误伤"正好 4 个 dict"的合法坐标列表
+    # （dict 不是 list，过不了这一关）。
+    if isinstance(data, (list, tuple)) and len(data) == 4 and all(
+        isinstance(x, (list, tuple)) for x in data
+    ):
+        return _merge_paired(*data)
+
+    if isinstance(data, dict) and set(_PAIRED_KEYS) <= set(data):
+        return _merge_paired(*(data[key] for key in _PAIRED_KEYS))
+
+    return to_dict_items(data)
 
 
 # --------------------------------------------------------------------------- #
@@ -537,6 +608,7 @@ __all__ = [
     "parse_detections",
     "decode_json_points",
     "to_dict_items",
+    "to_items",
     "normalize_to_unit",
     "check_coordinate_range",
     "format_coordinate_warnings",

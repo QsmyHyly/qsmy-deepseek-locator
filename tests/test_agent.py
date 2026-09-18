@@ -253,3 +253,39 @@ class TestItemCollection:
         assert out["text"].startswith("[")
         assert any(e["type"] == "done" for e in out["events"])
 
+
+class TestCollectItemsReadsToolResults:
+    """**回归**：collect_items 必须读得懂本库自带工具的返回结果。
+
+    2026-09-18 上游化时这里断过一次：collect_items 改调严格的 to_dict_items，
+    而 parse_coordinates 返回的是成对列表（没有 dict），于是**工具模式下永远收集不到坐标**，
+    表现为下游 SSE 里没有 annotated 事件、界面上一片空白，而模型其实答得好好的。
+    两个仓库的端到端自测同时红，就是从这里来的。
+
+    这一组刻意**不写死那个 JSON 字符串**，而是真的去调工具、把工具的输出喂进去 ——
+    否则工具的返回形态一变，测试照样绿，等于没测（那正是漏掉它的原因）。
+    """
+
+    def test_parse_coordinates_output_is_readable(self):
+        from qsmy_deepseek_locator.tools.builtin import build_default_registry
+
+        registry = build_default_registry()
+        result = registry.execute("parse_coordinates", {"text": '[{"bbox_2d": [180, 240, 430, 620]}]'})
+        assert result.ok, result.content
+
+        got = collect_items([{"type": "tool_result", "ok": True, "content": result.content}], "")
+        assert got, f"工具结果读不出来：{result.content!r}"
+        assert got[0]["bbox_2d"] == [0.18, 0.24, 0.43, 0.62]
+
+    def test_final_text_still_wins(self):
+        # 正文里已经有坐标时不必去翻工具结果（既有优先级不能被改坏）
+        events = [{"type": "tool_result", "ok": True, "content": '[[[0.9, 0.9, 0.95, 0.95]], ["x"], [], []]'}]
+        got = collect_items(events, '[{"bbox_2d": [0.1, 0.1, 0.2, 0.2], "label": "正文"}]')
+        assert got == [{"bbox_2d": [0.1, 0.1, 0.2, 0.2], "label": "正文"}]
+
+    def test_no_coordinates_anywhere_is_empty(self):
+        # 负向对照：没有任何坐标时必须老实返回空 ——
+        # 少了这一条，一个"永远返回点东西"的实现也能过上面两条。
+        assert collect_items([{"type": "tool_result", "ok": True, "content": "查到了，图里有三只猫"}], "") == []
+        assert collect_items([], "") == []
+
