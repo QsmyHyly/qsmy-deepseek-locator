@@ -339,6 +339,28 @@ def coerce_detections(items: Any) -> list[Detection]:
     return out
 
 
+def summarize(items: Any) -> dict[str, Any]:
+    """统计坐标对象数量与标签，供接口 / 页面展示。
+
+    口径是「原本写了几个对象」（to_dict_items），**不是**「画出来了几个」——
+    coerce_detections 会把没有坐标的项丢掉，报告数量时说前者才有意义。
+
+    为什么局部 import：本模块顶部只从 parsing 拿了 Detection 相关的几个名字，
+    为了这一个统计函数去扩顶部 import 块不值当。
+    """
+    from .parsing import BBOX_FIELD, POINT_FIELD, to_dict_items
+
+    data = to_dict_items(items)
+    bboxes = [d for d in data if BBOX_FIELD in d]
+    points = [d for d in data if POINT_FIELD in d]
+    return {
+        "total": len(data),
+        "bbox_count": len(bboxes),
+        "point_count": len(points),
+        "labels": [str(d.get("label", "")) for d in data],
+    }
+
+
 def _ratio_to_abs(value: float, total: int) -> int:
     """归一化比例 -> 像素，越界夹紧（绘制层的兜底，不改变原始数据）。"""
     try:

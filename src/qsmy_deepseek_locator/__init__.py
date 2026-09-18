@@ -100,6 +100,10 @@ from .parsing import (
     parse_detections,
 )
 from .prompts import DEFAULT_SYSTEM_PROMPT, DEFAULT_USER_PROMPT, build_user_prompt
+# 报文拼装的三个纯函数（0.1.3 上游化）：下游若有自己的配置对象，走 merge_thinking 这条
+# **不依赖 Settings** 的路径；image_part / thinking_payload 是「拼一次请求」的两块积木。
+# 它们本来就是公开行为，只是此前没进 __all__ —— 结果三个项目各抄了一份，见 request_build.py。
+from .request_build import image_part, merge_thinking, thinking_payload
 
 # 版本号有两个来源，必须一起改：
 #   装了包 -> importlib.metadata 从 dist-info 读（真来源是 pyproject.toml 的 [project] version）；
@@ -114,7 +118,7 @@ from .prompts import DEFAULT_SYSTEM_PROMPT, DEFAULT_USER_PROMPT, build_user_prom
 try:  # 版本号只有一个来源：pyproject.toml
     __version__ = _version("qsmy-deepseek-locator")
 except PackageNotFoundError:  # 未安装（直接从源码 import）时的兜底
-    __version__ = "0.1.2"
+    __version__ = "0.2.0"
 
 __all__ = [
     # 核心
@@ -139,6 +143,9 @@ __all__ = [
     "ChatReply",
     "build_messages",
     "build_request",
+    "image_part",
+    "thinking_payload",
+    "merge_thinking",     # 不依赖 Settings 的 thinking 规则本体，给下游复用
     "DEFAULT_BASE_URL",
     "DEFAULT_MODEL",
     "DEFAULT_TIMEOUT",

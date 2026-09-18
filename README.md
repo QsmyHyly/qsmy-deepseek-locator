@@ -169,6 +169,41 @@ qsmy-deepseek-locator bench --images-only --count 3           # 只造图不调�
 
 退出码：`0` 成功、`1` 运行期错误（缺 Key / 图片读不了 / 接口报错）、`2` 命令行用法错误。
 
+### 3.5 多轮：让模型自己调工具（Agent）
+
+前面几种都是**单轮**：一次请求、一次回答。需要模型自己动手（查图片尺寸、解析坐标、
+把标注画出来）时用 Agent 循环 —— 它会多轮调用模型，直到不再需要工具：
+
+```python
+from qsmy_deepseek_locator.agent import build_messages, run_agent, collect_items
+from qsmy_deepseek_locator.tools import build_default_registry
+
+messages = build_messages("把图里的红色圆点找出来", image_url="photo.png",
+                          system_prompt="（你的系统提示词）")
+events = []
+for event in run_agent(messages, tool_context={"source": "photo.png"}):
+    events.append(event)
+    if event["type"] == "content":
+        print(event["text"], end="", flush=True)   # 实时打字机
+
+items = collect_items(events, final_text=events[-1]["content"])
+```
+
+自带 6 个工具（解析坐标 ×3、看图片信息、画标注图、列调色板），要加自己的工具：
+
+```python
+registry = build_default_registry()
+registry.register(my_func, context_params={"source"})   # source 不暴露给模型，运行时注入
+run_agent(messages, registry=registry, tool_context={"source": "photo.png"})
+```
+
+⚠️ **它会多次调用模型，也就是多次计费** —— 所以它**不是** `locate(use_tools=True)` 的一个开关，
+而是一个要显式导入的独立入口：让"这次要花多少钱、要等多久"由调用方承接，
+而不是被一个参数偷偷决定。`locate` / `locate_to_file` 传 `use_tools=True` 会当场报错并指向这里。
+
+⚠️ `import qsmy_deepseek_locator` **不会**连带加载 agent 与工具框架（它们是可选能力），
+单轮定位的 import 成本不受影响。
+
 ## 4. 坐标约定（本库最要紧的一条）
 
 **所有坐标都是 0.0~1.0 的相对比例，小数位数不设上限。**
@@ -220,6 +255,28 @@ $ qsmy-deepseek-locator bench --count 5 --n-shapes 3 --annotate
 产物落在 `runs/benchmark/`：`images/`（图 + `ground_truth.json`）、`annotated/`（预测画回图）、`report.json`。
 
 编程接口：`from qsmy_deepseek_locator.benchmark import run_benchmark, evaluate_sample`。
+
+### 5.1 想知道"模型的感知边界在哪"，用探测型测试图
+
+几何图只能回答"定位准不准"。要量**模型能看清多小的东西**，用 `bench_generators` 里那几张图：
+
+| 生成器 | 量什么 | 真值 |
+|---|---|---|
+| `make_marker_image` + `markers_to_gt` | 帧几何与坐标约定（四角/四边/中心铺开的彩色圆点） | 圆心 + 半径 → 框，`match="center"` 判命中 |
+| `make_text_image` | 有效分辨率（字号阶梯，反推服务端缩放倍数） | 每行的字号与随机代码 |
+| `make_band_image` | 最小可分辨线间距 | 每条的间距与线数 |
+| `render_scaled` | 分辨率扫描（同一场景铺到不同栅格） | 各尺寸真值只差舍入（≤1e-4） |
+
+```python
+from qsmy_deepseek_locator.bench_generators import make_marker_image, markers_to_gt
+
+truth = make_marker_image("runs/marker.png", 900, 720)   # 画图 + 拿到真值
+gt = markers_to_gt(truth, 900, 720)                      # 转成 0.0~1.0 的可评测真值
+```
+
+⚠️ 这几张图**默认用你机器上的中文字体**。要跨机器可复现（对比历史结论），
+传入自己的字体解析：`make_marker_image(path, w, h, font_resolver=my_resolve_font)` ——
+见 §10.1 的说明。
 
 ## 6. API 速查
 
@@ -497,7 +554,9 @@ A：开调试日志，见 7.1 节：`locate("photo.png", "红色圆形", log_fil
 **Q：模型要调用工具时，本库会替我执行吗？**
 A：**不会**。`tools` 原样透传、调用请求拼好放在 `ChatReply.tool_calls`，到这儿为止 ——
 执行工具、把结果发回去、决定要不要再来一轮，全是调用方的事。
-`locate` / `locate_to_file` 的 `use_tools=True` 会直接抛 `NotImplementedError`（v0.1 没有 Agent 循环）。
+`locate` / `locate_to_file` 的 `use_tools=True` 会直接抛 `UnsupportedFeatureError`。
+工具循环**已经实现**了，入口是 `qsmy_deepseek_locator.agent.run_agent`（见 §3.5）——
+那个参数不会静默忽略，也不会替你打开一个会多次计费的循环。
 
 ## 9. 文档
 
@@ -506,13 +565,18 @@ A：**不会**。`tools` 原样透传、调用请求拼好放在 `ChatReply.tool
 - 其余说明按「文档就近写在代码里」的原则放在模块头注释：
   `prompts.py`（提示词为什么这么写）、`parsing.py`（刻度兜底与为何不猜）、
   `images.py`（编码策略）、`drawing.py`（中文字体）、`benchmark.py`（评测口径）、
+  `bench_score.py`（判分：三处刻意不统一的判定口径，别顺手"统一"掉）、
+  `bench_generators.py`（探测型测试图，以及"字体为什么必须可注入"）、
+  `agent.py`（工具循环：事件协议、以及那两个同名不同义的 tool_call）、
+  `tools/`（工具框架：为什么上下文参数要从 schema 里藏掉）、
   `debuglog.py`（调试日志记什么、为什么不记图片）、
   `http_client.py`（不装 openai 时用哪个客户端、两个客户端差在哪）、
   `errors.py`（异常为什么要多重继承、`WriteError` 为什么不继承 `OSError`）。
 
 ## 10. 与 `deepseek-vision-annotation` 的关系
 
-本库是从那个演示项目里**抽出来的核心**，两者的分工：
+本库最初是从那个演示项目里**抽出来的核心**；**2026-09-18（0.1.3）起这段关系变成双向共用** ——
+一批两边都在用的规则不再各持一份，而是收拢到本库，由两个项目（以及安卓 App）共同引用：
 
 | | deepseek-vision-annotation | 本库 |
 |---|---|---|
@@ -520,6 +584,25 @@ A：**不会**。`tools` 原样透传、调用请求拼好放在 `ChatReply.tool
 | 交互 | 浏览器界面、SSE 流式控制台 | Python API + CLI |
 | 无 Key 时 | 进 Mock 模式，页面照样能演示 | **直接报错**（不给假数据） |
 | 坐标口径 / 提示词 / 打标逻辑 | 同一套，已在本库中保留 | 同一套 |
+
+### 10.1 收拢过来的三样共用件（0.1.3）
+
+| 共用件 | 在库里 | 为什么它不该有两份 |
+|---|---|---|
+| thinking 的合并规则（按次覆盖 × 配置默认） | `request_build.merge_thinking` | 三处实现当时**已不严格等价**：下游写的是「不是真就关掉」，本库写的是「没表态就别发这个字段」 |
+| 探测型测试图（圆点阵 / 文字阶梯 / 竖线带 / 分辨率缩放） | `bench_generators` | 「改提示词必须重跑评测」是本库自己的规矩，而要重跑就得有**能暴露问题**的图，光有几何图不够 |
+| 判分口径（中心点命中 / 文本标签 / 坐标空间诊断） | `bench_score.center_hit`、`bench_shapes.text_label_ok`、`bench_score.evaluate_any_space` | 判分规则一旦分叉，两边的历史评测结论立刻不可比 —— 而且是**静默**不可比 |
+| 工具循环（多轮编排 / 工具注册执行 / 上下文注入） | `agent.run_agent`、`tools/`、`tool_schema` | 事件协议、工具报错要回填而不是抛穿、上下文参数要从 schema 里藏掉 —— 这些细节三边各写一遍，就是三次改漏的机会 |
+
+⚠️ **字体注入点**（`bench_generators` 的四个画图函数都有可选的 `font_resolver`）：
+本库不打包字体文件（安装体积与字体许可都要求如此），默认探测**当前机器**的系统字体，
+所以同一段代码在不同机器上画出的文字像素并不相同。自带字体的调用方必须注入自己的解析函数 ——
+评测素材的基本要求是「换台机器跑，图还是同一张」。实测不注入时的差异是 5265 个像素、
+**全部落在文字区域**，几何真值一字不差，图看上去完全正常。
+
+**依赖方向仍然是单向的**：本库不 import 演示项目或安卓 App 的任何东西，
+上面三样都是**先搬进本库**、再由它们反向引用。代价是演示项目多了一条
+`qsmy-deepseek-locator` 依赖（见它的 `requirements.txt`），换来的是这三套规则只有一份实现。
 
 ## 11. 许可证
 

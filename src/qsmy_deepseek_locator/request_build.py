@@ -1,7 +1,7 @@
 """报文拼装：把「一次定位」变成 DeepSeek Chat Completions 能收下的请求体。
 
-**职责**：纯函数拼报文 —— image_part / thinking_payload / resolve_thinking /
-build_messages / build_request。它们不碰网络、不碰 SDK，所以自测可以直接断言
+**职责**：纯函数拼报文 —— image_part / thinking_payload / merge_thinking /
+resolve_thinking / build_messages / build_request。它们不碰网络、不碰 SDK，所以自测可以直接断言
 「报文长什么样」而不必打桩整个客户端（见 tests/test_locate.py 的 TestMessageBuilding）。
 
 **边界**：本模块只管「请求长什么样」，不管发出去、也不管收回来。
@@ -46,23 +46,59 @@ def thinking_payload(enabled: bool | None) -> dict | None:
     return {"thinking": {"type": "enabled" if enabled else "disabled"}}
 
 
+def merge_thinking(
+    thinking: bool | None,
+    reasoning_effort: str | None = None,
+    *,
+    default_thinking: bool | None = None,
+    default_effort: str | None = None,
+) -> tuple[bool | None, str | None]:
+    """合并「按次覆盖」与「调用方给的默认值」，得到最终生效的 (thinking, effort)。
+
+    **这是不依赖 Settings 的那一半**（0.1.3 上游化时抽出）。规则与 resolve_thinking 一字不差，
+    但默认值由调用方以**原始值**传入，于是「自己有配置对象」的下游也能复用同一条规则，
+    不必为了它去依赖本库的 Settings 类型。
+
+    为什么值得单独存在：在抽出来之前，这条规则在三个项目里**各有一份实现** ——
+    旧演示项目 objloc/providers.py 与安卓 App 的同一份镜像都自己抄了一遍。
+    两份规则当时已经**不严格等价**：下游写的是「不是真就关掉」，把「默认值为 None」也当成
+    False；本库把 None 当成「两样都不传」。它们的 Settings.thinking 恰好是纯 bool，
+    所以现实中还没触发差异 —— 但只要下游哪天把默认值改成可空，行为就会静默变成另一种，
+    而这种漂移不会有任何测试报警。这正是要把它收成一份的理由。
+
+    规则（四条，改之前先看它们的来处）：
+    - thinking 为 None 且默认也没给 -> (None, None)，即两样都不传，服务端自己决定。
+      注意这里**不是** False：「没表态」与「明确关掉」是两回事，下游想要后者就传
+      default_thinking=False，或拿到 None 后按自己的口径解释（下游现在就是这么做的）；
+    - 显式关闭思考 -> (False, None)，此时 effort 无意义，直接丢掉；
+    - 开启思考时 effort 必须在白名单内，非法值一律不传（宁可走服务端默认，也不要 400）；
+    - effort 先 strip + lower 再比对，所以 "High " 是合法的。
+    """
+    enabled = default_thinking if thinking is None else bool(thinking)
+    if enabled is False:
+        return False, None
+    effort = (default_effort if reasoning_effort is None else reasoning_effort) or ""
+    effort = effort.strip().lower()
+    return enabled, (effort if effort in REASONING_EFFORTS else None)
+
+
 def resolve_thinking(
     settings: Settings, thinking: bool | None, reasoning_effort: str | None = None
 ) -> tuple[bool | None, str | None]:
     """合并「按次覆盖」与「配置默认」，得到最终生效的 (thinking, effort)。
 
-    规则：
-    - thinking 为 None 且配置也没给 -> (None, None)，即两样都不传，服务端自己决定；
-    - 显式关闭思考 -> (False, None)，此时 effort 无意义，直接丢掉；
-    - 开启思考时 effort 必须在白名单内，非法值一律不传（宁可走服务端默认，也不要 400）。
+    本函数只是 merge_thinking 的 Settings 版薄封装（0.1.3 起）：规则与取舍全在那边，
+    这里只负责把 settings 上的两个默认值取出来。保留它是因为它已是公开路径
+    （build_request 与下游既有调用点都在用），改名会破坏兼容。
+
+    ⚠️ 改这里之前先想清楚：任何「顺手多加一条规则」都会让三条路径重新分叉。
     """
-    enabled = settings.thinking if thinking is None else bool(thinking)
-    if enabled is False:
-        return False, None
-    effort = (settings.reasoning_effort if reasoning_effort is None else reasoning_effort) or ""
-    effort = effort.strip().lower()
-    effort = effort if effort in REASONING_EFFORTS else None
-    return enabled, effort
+    return merge_thinking(
+        thinking,
+        reasoning_effort,
+        default_thinking=settings.thinking,
+        default_effort=settings.reasoning_effort,
+    )
 
 
 def build_messages(
@@ -71,6 +107,7 @@ def build_messages(
     image_url: str | None = None,
     system_prompt: str | None = None,
     image_detail: str | None = None,
+    history: list[dict] | None = None,
 ) -> list[dict]:
     """拼 system + user 两条消息；有图时 user 用内容块数组（图片只能在 user 消息里）。
 
@@ -79,6 +116,8 @@ def build_messages(
     messages: list[dict] = []
     if system_prompt:
         messages.append({"role": "system", "content": system_prompt})
+    if history:
+        messages.extend(history)
     if image_url:
         messages.append({
             "role": "user",
@@ -132,6 +171,7 @@ def build_request(
 __all__ = [
     "image_part",
     "thinking_payload",
+    "merge_thinking",   # 0.1.3：不依赖 Settings 的规则本体，下游复用这一条
     "resolve_thinking",
     "build_messages",
     "build_request",

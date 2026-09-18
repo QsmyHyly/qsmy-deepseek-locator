@@ -21,8 +21,10 @@ from __future__ import annotations
 
 import json
 import random
+import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import Iterable
 
 from PIL import Image, ImageDraw
 
@@ -89,6 +91,51 @@ def color_ok(color_name: str, label: str) -> bool:
     """预测标签是否描述了正确的颜色。"""
     synonyms = COLOR_SYNONYMS.get(color_name) or [color_name[:1]]
     return any(s in label for s in synonyms)
+
+
+# --------------------------------------------------------------------------- #
+# 文本标签判定（第三套口径，与 color_ok / shape_ok 并列）
+# --------------------------------------------------------------------------- #
+# 网页元素的名称里经常带这些（"总销售额（今日）"、"加入购物车 >"），不归一化会误判为读错。
+_TEXT_NOISE = re.compile(r"[\s，。、,.:：;；!！?？\"'“”‘’()（）\[\]【】<>《》/\\|_\-—~\`·]+")
+
+
+def _fold_text(value: str) -> str:
+    """归一化文本标签：去掉空白与标点、统一小写。"""
+    return _TEXT_NOISE.sub("", str(value or "")).lower()
+
+
+def text_label_ok(gt_label: str, pred_label: str, *, aliases: Iterable[str] = (),
+                  min_len: int = 2) -> bool:
+    """「文本标签」的判定口径：归一化后相等，或一方包含另一方。
+
+    为什么不能复用 color_ok / shape_ok：那套是给几何图形用的（颜色名 + 形状名），
+    而网页截图里的目标标签是**界面上的中文名称**（"总销售额"、"加入购物车"），
+    既没有颜色也没有形状，硬套会得到恒为 0 的标签准确率。
+
+    为什么允许"一方包含另一方"：模型常在名称前后补限定语（"KPI 卡片：总销售额"），
+    也会把长文案截断（"无线降噪耳机" → "降噪耳机"）——这两种都算读对了。
+    为防单字误命中，要求被包含的一方至少 min_len 个字符。
+
+    aliases 是**同一元素的其它合理叫法**（真值里的 aliases，例如搜索框既写"搜索商品"
+    也可以叫"搜索框"）。它只用来避免"答对了却判错"，不是用来兜住错误答案的：
+    别名必须是"看着这张图的人也可能这么说"的名字。
+    ⚠️ 别把模型可能给出的答案整批抄成别名——那样这项指标就失去意义了。
+
+    真值在声明 label_mode="text" 时才会走到这里（见 bench_score.evaluate_sample）。
+    """
+    a = _fold_text(gt_label)
+    if not a:
+        return False
+    for candidate in (a, *(_fold_text(x) for x in aliases)):
+        b = _fold_text(pred_label)
+        if not candidate or not b:
+            continue
+        if candidate == b:
+            return True
+        if len(candidate) >= min_len and len(b) >= min_len and (candidate in b or b in candidate):
+            return True
+    return False
 
 
 def _darken(rgb: tuple[int, int, int], factor: float = 0.65) -> tuple[int, int, int]:

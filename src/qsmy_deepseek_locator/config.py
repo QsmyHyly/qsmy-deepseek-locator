@@ -155,6 +155,9 @@ class Settings:
     #
     # 注意它**不是**「发给模型」的参数：不进报文，只影响画标签那一步。
     font_path: str | None = None
+    # Agent 循环的最大轮数（只在 agent.run_agent 用得上；单轮定位不读它）。
+    # 默认 8 与演示项目一致：够模型「看一眼 → 调工具 → 再确认」，又不会无限打转。
+    max_tool_rounds: int = 8
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -172,6 +175,7 @@ class Settings:
             max_tokens=_env_int("QSML_MAX_TOKENS"),
             system_prompt=_env_str("QSML_SYSTEM_PROMPT") or DEFAULT_SYSTEM_PROMPT,
             log_file=_env_str("QSML_LOG_FILE"),
+            max_tool_rounds=_env_int("QSML_MAX_TOOL_ROUNDS") or 8,
             # 环境变量名与 drawing.FONT_PATH_ENV 是同一个串（QSML_FONT_PATH）。
             # 这里写字面量而不 import drawing：config 是被所有模块 import 的底座，
             # 让它反过来 import 一个要拉起 PIL 的模块，会让「只想用解析/提示词」的人

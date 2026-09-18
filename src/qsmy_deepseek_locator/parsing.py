@@ -24,7 +24,7 @@ from __future__ import annotations
 import ast
 import json
 from dataclasses import dataclass
-from typing import Any, Iterable, Iterator, Sequence
+from typing import Annotated, Any, Iterable, Iterator, Sequence
 
 # --------------------------------------------------------------------------- #
 # 坐标刻度常量
@@ -49,6 +49,28 @@ LEGACY_SCALE_NOTICE = (
 BBOX_FIELD = "bbox_2d"
 POINT_FIELD = "point_2d"
 _COORD_FIELDS = (BBOX_FIELD, POINT_FIELD)
+
+_COORDINATE_LIST_SCHEMA = {
+    "type": "array",
+    "description": "坐标列表对象，元素为含 bbox_2d 或 point_2d 的字典。",
+    "items": {
+        "type": "object",
+        "properties": {
+            "bbox_2d": {
+                "type": "array",
+                "items": {"type": "number"},
+                "description": "边界框 [x1, y1, x2, y2]，0.0~1.0 的相对比例。",
+            },
+            "point_2d": {
+                "type": "array",
+                "items": {"type": "number"},
+                "description": "点坐标 [x, y]，0.0~1.0 的相对比例。",
+            },
+            "label": {"type": "string", "description": "目标名称。"},
+        },
+    },
+}
+
 
 # 归一化路径下唯一会做舍入的地方：旧刻度换算是 350.25 -> 0.35025，
 # 保留 6 位足以无损表达千分之一刻度的全部有效小数。
@@ -146,6 +168,48 @@ def decode_json_points(text: str) -> Any:
     except Exception:  # noqa: BLE001
         return []
 
+
+def extract_coordinates(data: Annotated[list, _COORDINATE_LIST_SCHEMA]):
+    """将坐标列表对象拆分为 bbox 与 point 两组数据。
+
+    Args:
+        data: decode_json_points 返回的列表对象。
+
+    Returns:
+        bboxes: 边界框坐标列表，元素为 [x1, y1, x2, y2]
+        bbox_labels: 与 bboxes 一一对应的标签
+        points: 点坐标列表，元素为 [x, y]
+        point_labels: 与 points 一一对应的标签
+    """
+    bboxes = []
+    bbox_labels = []
+    points = []
+    point_labels = []
+
+    if isinstance(data, dict):
+        data = [data]
+    if not isinstance(data, list):
+        data = []
+
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        if "bbox_2d" in item:
+            bboxes.append(item["bbox_2d"])
+            label = item.get("label", f"bbox_{len(bboxes)}")
+            bbox_labels.append(label)
+
+        if "point_2d" in item:
+            points.append(item["point_2d"])
+            label = item.get("label", f"point_{len(points)}")
+            point_labels.append(label)
+
+    return bboxes, bbox_labels, points, point_labels
+
+
+def parse_coordinates(text: Annotated[str, "包含坐标 JSON 的文本，可带 ```json 代码块标记。"]):
+    """解析模型输出文本并直接拆分为 bbox / point 两组数据。"""
+    return extract_coordinates(decode_json_points(text))
 
 def to_dict_items(data: Any) -> list[dict]:
     """把解析结果统一成「坐标对象列表」（只保留 dict，其余丢弃）。"""

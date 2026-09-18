@@ -475,7 +475,8 @@ class Locator:
                 再大的图到服务端照样被缩到约 800x800。
                 @doc docs/API-NOTES.md#3-图片-token-与尺寸
                 （该文档解决"detail 到底改变了什么、为什么堆分辨率没用"的问题。）
-            use_tools: 是否开启工具（Agent）调用。v0.1 **没有实现工具循环**，只能保持 False；
+            use_tools: 是否开启工具（Agent）调用。**这里只能保持 False**：工具循环要多轮编排，
+                走 qsmy_deepseek_locator.agent.run_agent（0.2.0 起提供）。传 True 会当场报错，不会被静默忽略；
                 传 True 会当场抛 UnsupportedFeatureError（同时也是 NotImplementedError，
                 0.1.2 抛的就是它）。这是预留参数：宁可报错，也不静默忽略 ——
                 静默忽略会让你以为工具已经开了。
@@ -503,17 +504,23 @@ class Locator:
             与 locate() 内部 source_size 的行为一致。
         """
         if use_tools:
+            # 为什么不做成 locate() 的开关，而是指到另一个入口 —— 见下面这段说明。
             raise UnsupportedFeatureError(
-                "use_tools=True 目前不可用：v0.1 没有实现工具（Agent）调用循环。\n"
-                "这个参数是预留给调用点的，传 True 会当场报错而不是被静默忽略 —— "
-                "静默忽略会让你以为工具已经开了，那比报错危险得多。\n"
-                "需要多轮工具调用请参考 deepseek-vision-annotation 里的 Agent 实现，或等本库后续版本。\n"
+                "use_tools=True 不在这个入口上生效：本方法是**单轮**调用，"
+                "而工具（Agent）循环要多轮编排，它在另一个入口上：\n"
+                "    from qsmy_deepseek_locator.agent import run_agent\n"
+                "    for event in run_agent(messages, tool_context={'source': 图片}):\n"
+                "        ...   # round_start / reasoning / content / tool_call / tool_result / done\n"
+                "为什么不做成这里的一个布尔开关：Agent 循环每多一轮就多一次计费调用，"
+                "把它藏在 use_tools=True 后面，会让「这次要花多少钱、要等多久」"
+                "变得无法预期 —— 那必须是调用方显式承接的决定，不该由一个参数偷偷决定。\n"
                 "只想拿到模型的工具调用请求（不执行）可以用底层：\n"
                 "    client = DeepSeekVisionClient()\n"
                 "    reply = client.complete(messages, tools=[...])\n"
                 "    reply.tool_calls  # 已按 index 拼好，arguments 是完整 JSON 串\n"
                 "事件流示例见 examples/stream_events.py --tools。"
             )
+
 
         # 先校验输出路径再调模型：这是**故意**的顺序，一次 API 调用不该因为路径拼错而白花。
         # 父目录也在这里一并建出来，而不是等画完再 mkdir：路径不可写（父级是个文件、
@@ -621,7 +628,7 @@ def locate_to_file(
             api_key="sk-xxx",        # 传了就不读 DEEPSEEK_API_KEY
             thinking=True,           # 默认 False（显式关闭思考）
             image_detail="high",     # 默认 "original"
-            use_tools=False,         # v0.1 只能是 False，传 True 会报错
+            use_tools=False,         # 只能是 False；工具循环走 agent.run_agent
             font_path="/system/fonts/NotoSansCJK-Regular.ttc",   # 指定中文字体（默认自动探测）
             cancel_event=threading.Event(),   # 想要「取消」按钮时给（见 Locator.locate）
         )
