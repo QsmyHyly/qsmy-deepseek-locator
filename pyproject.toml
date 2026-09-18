@@ -10,7 +10,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "qsmy-deepseek-locator"
-version = "0.2.0"
+# 0.2.1：0.2.0 发布之后才补进来的 to_items 一直没进过任何已发布产物 ——
+# PyPI 上的 0.2.0 与源码里的 0.2.0 不是同一份东西，下游 pip 装到的库没有它。
+# 本次只补这个缺口，不改任何已有行为。发版前请先跑 tools/check_release.py。
+version = "0.2.1"
 description = "用 DeepSeek 视觉模型做物体定位：一张图 + 一句话，得到归一化坐标（bbox/point）与中文名称，可直接打标出图。"
 readme = "README.md"
 requires-python = ">=3.9"

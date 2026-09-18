@@ -118,7 +118,7 @@ from .request_build import image_part, merge_thinking, thinking_payload
 try:  # 版本号只有一个来源：pyproject.toml
     __version__ = _version("qsmy-deepseek-locator")
 except PackageNotFoundError:  # 未安装（直接从源码 import）时的兜底
-    __version__ = "0.2.0"
+    __version__ = "0.2.1"
 
 __all__ = [
     # 核心
