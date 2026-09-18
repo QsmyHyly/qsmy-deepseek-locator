@@ -33,7 +33,8 @@ classifiers = [
   "Topic :: Multimedia :: Graphics",
 ]
 # 必装依赖刻意只有两个：Pillow 与 requests。
-# openai 降级为可选 extra（本次改动；与仓内其余「0.1.2 -> 0.1.3 等价重构」的说法同指一批未发布的工作）：
+# openai 降级为可选 extra（本次改动；与仓内其余「0.1.2 -> 0.2.0 等价重构」的说法同指一批工作 ——
+# 那批当时口头叫「0.1.3」，但**这个版本号从未发布过**，实际是随 0.2.0 一起发出去的，见 README §10）：
 # 它依赖 jiter 与 pydantic-core 两个 **Rust 扩展**，
 # 二者都没有 Android/aarch64 wheel（pip install --dry-run openai 实测报
 # "Target triple not supported by rustup"），于是安卓上「照文档装一遍」直接装不上。
